@@ -87,7 +87,14 @@ async fn wt_tcp_concurrent_and_udp_echo() -> Result<()> {
         None,
         false,
     ));
-    tokio::spawn(ws_server::run_ws_server(cfg.ws_bind, None, policy, None, None, false));
+    tokio::spawn(ws_server::run_ws_server(
+        cfg.ws_bind,
+        None,
+        policy,
+        None,
+        None,
+        false,
+    ));
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let client_cfg = ClientConfig::builder()
@@ -95,7 +102,9 @@ async fn wt_tcp_concurrent_and_udp_echo() -> Result<()> {
         .with_server_certificate_hashes([hash])
         .build();
     let client = Endpoint::client(client_cfg)?;
-    let conn = client.connect(format!("https://127.0.0.1:{wt_port}/")).await?;
+    let conn = client
+        .connect(format!("https://127.0.0.1:{wt_port}/"))
+        .await?;
 
     // Open control stream
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?.await?;
@@ -187,19 +196,27 @@ async fn wt_tcp_concurrent_and_udp_echo() -> Result<()> {
     // WebSocket Wisp v1 fallback test
     let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{ws_port}/")).await?;
     let first = ws.next().await.unwrap()?;
-    let Message::Binary(b) = first else { panic!("expected binary") };
+    let Message::Binary(b) = first else {
+        panic!("expected binary")
+    };
     assert_eq!(b[0], ws_pkt::CONTINUE);
 
     let mut creq = vec![ws_stream_type::TCP];
     creq.extend_from_slice(&echo_tcp.port().to_le_bytes());
     creq.extend_from_slice(b"127.0.0.1");
-    ws.send(Message::Binary(encode_ws_packet(ws_pkt::CONNECT, 1, &creq).into()))
-        .await?;
-    ws.send(Message::Binary(encode_ws_packet(ws_pkt::DATA, 1, b"ws-echo").into()))
-        .await?;
+    ws.send(Message::Binary(
+        encode_ws_packet(ws_pkt::CONNECT, 1, &creq).into(),
+    ))
+    .await?;
+    ws.send(Message::Binary(
+        encode_ws_packet(ws_pkt::DATA, 1, b"ws-echo").into(),
+    ))
+    .await?;
 
     let reply = ws.next().await.unwrap()?;
-    let Message::Binary(rb) = reply else { panic!("expected binary") };
+    let Message::Binary(rb) = reply else {
+        panic!("expected binary")
+    };
     assert_eq!(rb[0], ws_pkt::DATA);
     assert_eq!(&rb[5..], b"ws-echo");
 
@@ -235,7 +252,9 @@ async fn ssrf_blocks_loopback_when_disabled() -> Result<()> {
         .with_server_certificate_hashes([hash])
         .build();
     let client = Endpoint::client(client_cfg)?;
-    let conn = client.connect(format!("https://127.0.0.1:{wt_port}/")).await?;
+    let conn = client
+        .connect(format!("https://127.0.0.1:{wt_port}/"))
+        .await?;
 
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?.await?;
     ctrl_send.write_all(&[stream_kind::CONTROL]).await?;
@@ -329,10 +348,14 @@ async fn ws_over_260_sequential_tcp_streams_no_slot_leak() -> anyhow::Result<()>
         let mut creq = vec![ws_stream_type::TCP];
         creq.extend_from_slice(&echo_tcp.port().to_le_bytes());
         creq.extend_from_slice(b"127.0.0.1");
-        ws.send(Message::Binary(encode_ws_packet(ws_pkt::CONNECT, sid, &creq).into()))
-            .await?;
-        ws.send(Message::Binary(encode_ws_packet(ws_pkt::DATA, sid, b"hi").into()))
-            .await?;
+        ws.send(Message::Binary(
+            encode_ws_packet(ws_pkt::CONNECT, sid, &creq).into(),
+        ))
+        .await?;
+        ws.send(Message::Binary(
+            encode_ws_packet(ws_pkt::DATA, sid, b"hi").into(),
+        ))
+        .await?;
 
         let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await?
@@ -343,8 +366,10 @@ async fn ws_over_260_sequential_tcp_streams_no_slot_leak() -> anyhow::Result<()>
         assert_eq!(rb[0], ws_pkt::DATA, "stream {sid} failed");
         assert_eq!(&rb[5..], b"hi");
 
-        ws.send(Message::Binary(encode_ws_packet(ws_pkt::CLOSE, sid, &[0x02]).into()))
-            .await?;
+        ws.send(Message::Binary(
+            encode_ws_packet(ws_pkt::CLOSE, sid, &[0x02]).into(),
+        ))
+        .await?;
     }
     Ok(())
 }
@@ -376,7 +401,9 @@ async fn wt_fragmented_control_frames() -> anyhow::Result<()> {
             .with_server_certificate_hashes([cert_hash.into()])
             .build(),
     )?;
-    let conn = client.connect(format!("https://127.0.0.1:{wt_port}/")).await?;
+    let conn = client
+        .connect(format!("https://127.0.0.1:{wt_port}/"))
+        .await?;
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?.await?;
 
     let info_payload = encode_info(&InfoPayload {
@@ -425,7 +452,9 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
                     "HTTP/1.1 302 Found\r\nLocation: https://evil.example/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                 } else {
                     let has_secret = req.to_ascii_lowercase().contains("x-api-key: secret-123");
-                    let has_client_auth = req.to_ascii_lowercase().contains("authorization: client-spoof");
+                    let has_client_auth = req
+                        .to_ascii_lowercase()
+                        .contains("authorization: client-spoof");
                     let body = format!("secret={has_secret};spoof={has_client_auth}");
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -438,7 +467,8 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
         }
     });
 
-    let cfg_path = std::env::temp_dir().join(format!("wisp_auth_proxy_{}.json", std::process::id()));
+    let cfg_path =
+        std::env::temp_dir().join(format!("wisp_auth_proxy_{}.json", std::process::id()));
     let proxy_json = serde_json::json!({
         "routes": [{
             "id": "api",
@@ -461,7 +491,8 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
     let tls = load_or_generate_tls(None, None, true, &[])?;
     let cert_hash = tls.cert_sha256;
     let policy = SecurityPolicy::from_config(&cfg);
-    let auth_proxy = std::sync::Arc::new(wisp_wt_relay::auth_proxy::AuthProxy::from_file(&cfg_path)?);
+    let auth_proxy =
+        std::sync::Arc::new(wisp_wt_relay::auth_proxy::AuthProxy::from_file(&cfg_path)?);
     tokio::spawn(wt_server::run_wt_server(
         cfg.wt_bind,
         tls.identity,
@@ -479,7 +510,9 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
             .with_server_certificate_hashes([cert_hash.into()])
             .build(),
     )?;
-    let conn = client.connect(format!("https://127.0.0.1:{wt_port}/")).await?;
+    let conn = client
+        .connect(format!("https://127.0.0.1:{wt_port}/"))
+        .await?;
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?.await?;
     ctrl_send.write_all(&[stream_kind::CONTROL]).await?;
     let info_payload = encode_info(&InfoPayload {
@@ -524,7 +557,10 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
     let mut resp_buf = Vec::new();
     p_recv.read_to_end(&mut resp_buf).await?;
     let resp_str = String::from_utf8_lossy(&resp_buf);
-    assert!(resp_str.contains("secret=true;spoof=false"), "got: {resp_str}");
+    assert!(
+        resp_str.contains("secret=true;spoof=false"),
+        "got: {resp_str}"
+    );
 
     // 3. Disallowed path returns 403
     let (mut d_send, mut d_recv) = conn.open_bi().await?.await?;

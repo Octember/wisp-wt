@@ -35,7 +35,9 @@ pub async fn run_ws_server(
     auth_proxy: Option<Arc<AuthProxy>>,
     disable_raw_tcp: bool,
 ) -> Result<()> {
-    let listener = TcpListener::bind(bind).await.context("Bind WebSocket server")?;
+    let listener = TcpListener::bind(bind)
+        .await
+        .context("Bind WebSocket server")?;
     let local_addr = listener.local_addr()?;
     let tls_acceptor = tls_config.map(TlsAcceptor::from);
     info!(%local_addr, tls = tls_acceptor.is_some(), "WebSocket Wisp fallback relay listening");
@@ -103,7 +105,11 @@ where
                 return Err(ErrorResponse::new(Some("Forbidden origin".into())));
             }
 
-            let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+            let path = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
             let token = extract_query_token(path).or_else(|| {
                 req.headers()
                     .get("authorization")
@@ -169,7 +175,9 @@ where
             minor: 1,
             extensions: exts,
         });
-        let _ = out_tx.send(encode_ws_packet(ws_pkt::INFO, 0, &info_bytes)).await;
+        let _ = out_tx
+            .send(encode_ws_packet(ws_pkt::INFO, 0, &info_bytes))
+            .await;
 
         // Wait for client INFO with timeout.
         let info_msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws_stream.next()).await;
@@ -179,7 +187,11 @@ where
         };
         if first.len() < 5 || first[0] != ws_pkt::INFO {
             let _ = out_tx
-                .send(encode_ws_packet(ws_pkt::CLOSE, 0, &[close_reason::INVALID_INFO]))
+                .send(encode_ws_packet(
+                    ws_pkt::CLOSE,
+                    0,
+                    &[close_reason::INVALID_INFO],
+                ))
                 .await;
             finish_writer(out_tx, writer_task).await;
             return Ok(());
@@ -205,7 +217,11 @@ where
         }
     } else if policy.requires_auth() && session_token.is_none() {
         let _ = out_tx
-            .send(encode_ws_packet(ws_pkt::CLOSE, 0, &[close_reason::AUTH_REQUIRED]))
+            .send(encode_ws_packet(
+                ws_pkt::CLOSE,
+                0,
+                &[close_reason::AUTH_REQUIRED],
+            ))
             .await;
         finish_writer(out_tx, writer_task).await;
         return Ok(());
@@ -217,7 +233,11 @@ where
 
     // Send initial CONTINUE on stream 0.
     let _ = out_tx
-        .send(encode_ws_packet(ws_pkt::CONTINUE, 0, &INITIAL_BUFFER.to_le_bytes()))
+        .send(encode_ws_packet(
+            ws_pkt::CONTINUE,
+            0,
+            &INITIAL_BUFFER.to_le_bytes(),
+        ))
         .await;
 
     struct StreamDropGuard {
@@ -282,7 +302,11 @@ where
                 let port = u16::from_le_bytes([payload[1], payload[2]]);
                 let Ok(host) = std::str::from_utf8(&payload[3..]) else {
                     let _ = out_tx
-                        .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::INVALID_INFO]))
+                        .send(encode_ws_packet(
+                            ws_pkt::CLOSE,
+                            stream_id,
+                            &[close_reason::INVALID_INFO],
+                        ))
                         .await;
                     continue;
                 };
@@ -296,7 +320,11 @@ where
                 if stype == ws_stream_type::TCP {
                     if disable_raw_tcp || principal.as_ref().is_some_and(|p| !p.allow_raw_tcp) {
                         let _ = out_tx
-                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::BLOCKED]))
+                            .send(encode_ws_packet(
+                                ws_pkt::CLOSE,
+                                stream_id,
+                                &[close_reason::BLOCKED],
+                            ))
                             .await;
                         continue;
                     }
@@ -305,27 +333,43 @@ where
                             stream_id,
                             done_tx: done_tx_c,
                         };
-                        let addrs = match resolve_and_check_target(&host_owned, port, &policy_c).await {
-                            Ok(a) => a,
-                            Err(r) => {
-                                let _ = out_tx_c.send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r])).await;
-                                return;
-                            }
-                        };
-                        let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addrs[..])).await {
+                        let addrs =
+                            match resolve_and_check_target(&host_owned, port, &policy_c).await {
+                                Ok(a) => a,
+                                Err(r) => {
+                                    let _ = out_tx_c
+                                        .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r]))
+                                        .await;
+                                    return;
+                                }
+                            };
+                        let tcp = match tokio::time::timeout(
+                            CONNECT_TIMEOUT,
+                            TcpStream::connect(&addrs[..]),
+                        )
+                        .await
+                        {
                             Ok(Ok(s)) => s,
                             Ok(Err(e)) => {
                                 let r = match e.kind() {
-                                    std::io::ErrorKind::ConnectionRefused => close_reason::CONNECTION_REFUSED,
+                                    std::io::ErrorKind::ConnectionRefused => {
+                                        close_reason::CONNECTION_REFUSED
+                                    }
                                     std::io::ErrorKind::TimedOut => close_reason::CONNECT_TIMEOUT,
                                     _ => close_reason::UNREACHABLE,
                                 };
-                                let _ = out_tx_c.send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r])).await;
+                                let _ = out_tx_c
+                                    .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r]))
+                                    .await;
                                 return;
                             }
                             Err(_) => {
                                 let _ = out_tx_c
-                                    .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::CONNECT_TIMEOUT]))
+                                    .send(encode_ws_packet(
+                                        ws_pkt::CLOSE,
+                                        stream_id,
+                                        &[close_reason::CONNECT_TIMEOUT],
+                                    ))
                                     .await;
                                 return;
                             }
@@ -343,7 +387,8 @@ where
                                 received += 1;
                                 if received >= INITIAL_BUFFER / 2 {
                                     received = 0;
-                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len()) as u32;
+                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len())
+                                        as u32;
                                     let _ = out_w
                                         .send(encode_ws_packet(
                                             ws_pkt::CONTINUE,
@@ -361,13 +406,21 @@ where
                                 match tr.read(&mut buf).await {
                                     Ok(0) => {
                                         let _ = out_r
-                                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::VOLUNTARY]))
+                                            .send(encode_ws_packet(
+                                                ws_pkt::CLOSE,
+                                                stream_id,
+                                                &[close_reason::VOLUNTARY],
+                                            ))
                                             .await;
                                         break;
                                     }
                                     Ok(n) => {
                                         if out_r
-                                            .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
+                                            .send(encode_ws_packet(
+                                                ws_pkt::DATA,
+                                                stream_id,
+                                                &buf[..n],
+                                            ))
                                             .await
                                             .is_err()
                                         {
@@ -376,7 +429,11 @@ where
                                     }
                                     Err(_) => {
                                         let _ = out_r
-                                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::NETWORK_ERROR]))
+                                            .send(encode_ws_packet(
+                                                ws_pkt::CLOSE,
+                                                stream_id,
+                                                &[close_reason::NETWORK_ERROR],
+                                            ))
                                             .await;
                                         break;
                                     }
@@ -397,20 +454,25 @@ where
                             stream_id,
                             done_tx: done_tx_c,
                         };
-                        let addrs = match resolve_and_check_target(&host_owned, port, &policy_c).await {
-                            Ok(a) => a,
-                            Err(r) => {
-                                let _ = out_tx_c.send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r])).await;
-                                return;
-                            }
-                        };
+                        let addrs =
+                            match resolve_and_check_target(&host_owned, port, &policy_c).await {
+                                Ok(a) => a,
+                                Err(r) => {
+                                    let _ = out_tx_c
+                                        .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r]))
+                                        .await;
+                                    return;
+                                }
+                            };
                         let target = addrs[0];
                         let bind_addr: SocketAddr = if target.is_ipv4() {
                             "0.0.0.0:0".parse().unwrap()
                         } else {
                             "[::]:0".parse().unwrap()
                         };
-                        let Ok(sock) = UdpSocket::bind(bind_addr).await else { return };
+                        let Ok(sock) = UdpSocket::bind(bind_addr).await else {
+                            return;
+                        };
                         if sock.connect(target).await.is_err() {
                             return;
                         }
@@ -430,7 +492,11 @@ where
                                 match sock_r.recv(&mut buf).await {
                                     Ok(n) => {
                                         if out_r
-                                            .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
+                                            .send(encode_ws_packet(
+                                                ws_pkt::DATA,
+                                                stream_id,
+                                                &buf[..n],
+                                            ))
                                             .await
                                             .is_err()
                                         {
@@ -452,7 +518,11 @@ where
                 } else if stype == ws_stream_type::HTTP_PROXY {
                     let (Some(ap), Some(p)) = (auth_proxy.as_ref(), principal.as_ref()) else {
                         let _ = out_tx
-                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::BLOCKED]))
+                            .send(encode_ws_packet(
+                                ws_pkt::CLOSE,
+                                stream_id,
+                                &[close_reason::BLOCKED],
+                            ))
                             .await;
                         continue;
                     };
@@ -485,7 +555,8 @@ where
                                 received += 1;
                                 if received >= INITIAL_BUFFER / 2 {
                                     received = 0;
-                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len()) as u32;
+                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len())
+                                        as u32;
                                     let _ = out_w
                                         .send(encode_ws_packet(
                                             ws_pkt::CONTINUE,
@@ -514,7 +585,11 @@ where
                                     }
                                     Ok(n) => {
                                         if out_r
-                                            .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
+                                            .send(encode_ws_packet(
+                                                ws_pkt::DATA,
+                                                stream_id,
+                                                &buf[..n],
+                                            ))
                                             .await
                                             .is_err()
                                         {

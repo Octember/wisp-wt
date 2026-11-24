@@ -44,7 +44,10 @@ pub fn load_or_generate_tls(
         .context("Certificate chain must contain at least one certificate")?;
     let digest: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
     let cert_sha256_base64 = STANDARD.encode(digest);
-    let cert_sha256_hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let cert_sha256_hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
 
     let wt_certs: Vec<wtransport::tls::Certificate> = certs
         .iter()
@@ -102,8 +105,8 @@ fn generate_self_signed(
         }
     }
 
-    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-        .context("Generate ECDSA P-256 key pair")?;
+    let key_pair =
+        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("Generate ECDSA P-256 key pair")?;
     let mut params = CertificateParams::new(sans).context("Create CertificateParams")?;
     params
         .distinguished_name

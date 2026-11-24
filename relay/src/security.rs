@@ -258,7 +258,11 @@ pub async fn resolve_and_check_target(
     if host_lower.is_empty() {
         return Err(close_reason::INVALID_INFO);
     }
-    if policy.block_hosts.iter().any(|b| host_lower == *b || host_lower.ends_with(&format!(".{b}"))) {
+    if policy
+        .block_hosts
+        .iter()
+        .any(|b| host_lower == *b || host_lower.ends_with(&format!(".{b}")))
+    {
         return Err(close_reason::BLOCKED);
     }
     if !policy.allow_hosts.is_empty()
@@ -270,14 +274,12 @@ pub async fn resolve_and_check_target(
         return Err(close_reason::BLOCKED);
     }
 
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        lookup_host((host, port)),
-    )
-    .await
-    .map_err(|_| close_reason::UNREACHABLE)?
-    .map_err(|_| close_reason::UNREACHABLE)?
-    .collect();
+    let addrs: Vec<SocketAddr> =
+        tokio::time::timeout(std::time::Duration::from_secs(5), lookup_host((host, port)))
+            .await
+            .map_err(|_| close_reason::UNREACHABLE)?
+            .map_err(|_| close_reason::UNREACHABLE)?
+            .collect();
 
     if addrs.is_empty() {
         return Err(close_reason::UNREACHABLE);

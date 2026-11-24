@@ -331,9 +331,9 @@ async fn main() -> Result<()> {
                 }));
             } else {
                 let c = Arc::clone(&ws_client);
-                handles.push(tokio::spawn(async move {
-                    c.fetch(&h, origin_port, size).await
-                }));
+                handles.push(tokio::spawn(
+                    async move { c.fetch(&h, origin_port, size).await },
+                ));
             }
         }
         let mut lats = Vec::new();

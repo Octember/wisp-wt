@@ -46,7 +46,11 @@ pub async fn run_relay(cfg: RelayConfig) -> Result<()> {
         auth_proxy.clone(),
         cfg.disable_raw_tcp,
     );
-    let ws_tls = if cfg.ws_tls { Some(tls.rustls_config) } else { None };
+    let ws_tls = if cfg.ws_tls {
+        Some(tls.rustls_config)
+    } else {
+        None
+    };
     let ws_fut = ws_server::run_ws_server(
         cfg.ws_bind,
         ws_tls,
@@ -57,7 +61,8 @@ pub async fn run_relay(cfg: RelayConfig) -> Result<()> {
     );
 
     if let Some(dev_bind) = cfg.dev_http_bind {
-        let dev_fut = run_dev_http_server(dev_bind, cfg.wt_bind, cfg.ws_bind, tls.cert_sha256_base64);
+        let dev_fut =
+            run_dev_http_server(dev_bind, cfg.wt_bind, cfg.ws_bind, tls.cert_sha256_base64);
         tokio::select! {
             r = wt_fut => r?,
             r = ws_fut => r?,
@@ -93,15 +98,13 @@ async fn run_dev_http_server(
         let body = body.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let n = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                sock.read(&mut buf),
-            )
-            .await
-            {
-                Ok(Ok(n)) if n > 0 => n,
-                _ => return,
-            };
+            let n =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut buf))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => n,
+                    _ => return,
+                };
             let req = String::from_utf8_lossy(&buf[..n]);
             let first_line = req.lines().next().unwrap_or("");
             let is_cert_hash = first_line.starts_with("GET /cert-hash ")

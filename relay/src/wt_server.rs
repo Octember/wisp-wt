@@ -1,8 +1,7 @@
 use crate::auth_proxy::{AuthProxy, SessionPrincipal, handle_http_proxy_io};
 use crate::protocol::{
     Extension, InfoPayload, close_reason, control_msg, decode_info, decode_varint,
-    encode_control_frame, encode_info, encode_varint, ext_id, extract_token_from_info,
-    stream_kind,
+    encode_control_frame, encode_info, encode_varint, ext_id, extract_token_from_info, stream_kind,
 };
 use crate::security::{
     SecurityPolicy, extract_bearer_header, extract_query_token, resolve_and_check_target,
@@ -120,7 +119,10 @@ async fn run_wt_session(
         .await
         .context("WebTransport control stream kind read timed out")??;
     if kind_buf[0] != stream_kind::CONTROL {
-        bail!("First WebTransport stream must be control (0x00), got 0x{:02x}", kind_buf[0]);
+        bail!(
+            "First WebTransport stream must be control (0x00), got 0x{:02x}",
+            kind_buf[0]
+        );
     }
 
     // 2. Read CLIENT_INFO frame.
@@ -193,7 +195,10 @@ async fn run_wt_session(
         .write_all(&encode_control_frame(control_msg::INFO, &server_info))
         .await?;
 
-    let max_dgram = conn.max_datagram_size().unwrap_or(1200).min(u16::MAX as usize) as u16;
+    let max_dgram = conn
+        .max_datagram_size()
+        .unwrap_or(1200)
+        .min(u16::MAX as usize) as u16;
     let mut ready_payload = Vec::with_capacity(6);
     ready_payload.extend_from_slice(&(policy.max_streams_per_session as u32).to_le_bytes());
     ready_payload.extend_from_slice(&max_dgram.to_le_bytes());
@@ -615,7 +620,11 @@ async fn handle_udp_bind(
             .await;
     });
 
-    if let Some(old) = udp_flows.lock().await.insert(flow_id, UdpFlow { socket: sock, task }) {
+    if let Some(old) = udp_flows
+        .lock()
+        .await
+        .insert(flow_id, UdpFlow { socket: sock, task })
+    {
         old.task.abort();
     }
     send_udp_bound(ctrl_send, flow_id, 0x00).await?;

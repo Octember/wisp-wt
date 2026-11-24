@@ -3,7 +3,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "wisp-wt-relay", about = "Dual-stack WebTransport + WebSocket Wisp relay")]
+#[command(
+    name = "wisp-wt-relay",
+    about = "Dual-stack WebTransport + WebSocket Wisp relay"
+)]
 pub struct RelayConfig {
     /// UDP bind address for HTTP/3 WebTransport
     #[arg(long, env = "WISP_WT_BIND", default_value = "127.0.0.1:4433")]
@@ -38,7 +41,11 @@ pub struct RelayConfig {
     pub cert_sans: Vec<String>,
 
     /// Allowed Origin headers (exact or wildcard host prefix like https://*.trynix.dev)
-    #[arg(long = "allow-origin", env = "WISP_ALLOW_ORIGINS", value_delimiter = ',')]
+    #[arg(
+        long = "allow-origin",
+        env = "WISP_ALLOW_ORIGINS",
+        value_delimiter = ','
+    )]
     pub allow_origins: Vec<String>,
 
     /// Allow any Origin (for local development only)

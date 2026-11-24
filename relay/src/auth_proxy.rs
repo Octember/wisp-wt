@@ -172,7 +172,11 @@ impl AuthProxy {
         serde_json::to_vec(&AdvertisedRoutesPayload { routes }).unwrap_or_else(|_| b"{}".to_vec())
     }
 
-    pub fn get_route(&self, route_id: &str, principal: &SessionPrincipal) -> Option<Arc<CompiledRoute>> {
+    pub fn get_route(
+        &self,
+        route_id: &str,
+        principal: &SessionPrincipal,
+    ) -> Option<Arc<CompiledRoute>> {
         if !principal.allowed_routes.iter().any(|id| id == route_id) {
             return None;
         }
@@ -192,10 +196,7 @@ fn compile_route(r: AuthProxyRouteConfig) -> Result<CompiledRoute> {
     if scheme != "http" && scheme != "https" {
         bail!("Unsupported upstream scheme '{scheme}' for route {}", r.id);
     }
-    let host = uri
-        .host()
-        .context("Upstream URI missing host")?
-        .to_string();
+    let host = uri.host().context("Upstream URI missing host")?.to_string();
     let default_port = if scheme == "https" { 443 } else { 80 };
     let port = uri.port_u16().unwrap_or(default_port);
     let host_header = if uri.port_u16().is_some() {
@@ -285,9 +286,7 @@ where
         let route = Arc::clone(&route);
         let proxy = Arc::clone(&proxy);
         let policy = policy.clone();
-        async move {
-            Ok::<_, hyper::Error>(proxy_single_request(req, &route, &proxy, &policy).await)
-        }
+        async move { Ok::<_, hyper::Error>(proxy_single_request(req, &route, &proxy, &policy).await) }
     });
 
     hyper::server::conn::http1::Builder::new()
@@ -326,10 +325,7 @@ async fn proxy_single_request(
     }
 
     if !route.allowed_methods.is_empty()
-        && !route
-            .allowed_methods
-            .iter()
-            .any(|m| m == method.as_str())
+        && !route.allowed_methods.iter().any(|m| m == method.as_str())
     {
         warn!(route_id = %route.id, %method, %path, "auth_proxy_disallowed_method");
         return simple_response(StatusCode::FORBIDDEN, "Method not allowed");
