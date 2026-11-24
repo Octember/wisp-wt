@@ -19,7 +19,7 @@ import {
   parseServerInfo,
   toError,
   utf8Encode,
-} from "./protocol.ts";
+} from "./protocol.js";
 import type {
   AuthProxyRoute,
   WebTransportConstructor,
@@ -30,7 +30,7 @@ import type {
   WispTcpStreamEvents,
   WispUdpFlow,
   WispUdpFlowEvents,
-} from "./types.ts";
+} from "./types.js";
 
 interface PendingUdpBind {
   resolve: () => void;
@@ -83,7 +83,15 @@ export class WispWebTransportSession implements WispSession {
       ? { serverCertificateHashes: opts.serverCertificateHashes }
       : undefined;
     const transport = new WT(url, wtOpts);
-    await transport.ready;
+    try {
+      await transport.ready;
+    } catch (err) {
+      const base = toError(err);
+      throw new Error(
+        `WebTransport connection to ${url} failed: ${base.message} (possible causes: UDP/443 blocked, Origin rejected, self-signed serverCertificateHashes / >14d cert, or invalid token)`,
+        { cause: base },
+      );
+    }
 
     const session = new WispWebTransportSession(transport);
     try {
@@ -313,7 +321,7 @@ export class WispWebTransportSession implements WispSession {
           }
         }
       } catch (err) {
-        finish(err instanceof Error ? err : new Error(String(err)));
+        finish(toError(err));
       } finally {
         pumping = false;
       }
@@ -389,7 +397,7 @@ export class WispWebTransportSession implements WispSession {
           }
         }
       } catch (err) {
-        finish(err instanceof Error ? err : new Error(String(err)));
+        finish(toError(err));
       }
     })();
 

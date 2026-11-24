@@ -37,6 +37,7 @@ The first byte of every client-initiated QUIC bidirectional stream identifies it
 | :--- | :--- | :--- |
 | `0x00` | **Control Stream** | Exactly 1 (opened first by client) |
 | `0x01` | **Guest TCP Stream** | 1 per guest TCP connection |
+| `0x02` | **`HTTP_PROXY` Stream** | 1 per capability-gated HTTP proxy request |
 
 ### 2.3 Control Stream (`0x00`) Framing
 
@@ -63,6 +64,7 @@ After the leading `0x00` kind byte, messages on the Control Stream are framed as
   - `0x03` — Public/Private Key Auth (Wisp v2)
   - `0x04` — Server MOTD (`char[]` UTF-8)
   - `0x05` — Stream Open Confirmation (empty payload)
+  - `0x11` — `AUTH_PROXY` (JSON list of advertised routes & virtual hosts)
   - `0x10` — Bearer Token Auth (`char[]` UTF-8 token)
 
 - **`0x03` `READY`** (server → client; reuses Wisp `CONTINUE` opcode):
@@ -153,9 +155,9 @@ After `UDP_BIND` / `UDP_BOUND` succeeds on the Control Stream, UDP packets are s
 ## 5. Open Questions
 
 1. **Upstream Wisp v2 spec PR vs. standalone `wisp-wt` package?**  
-   Ship standalone `@noahbuiltit/wisp-wt` first to validate cross-browser behavior (Chrome, Firefox, Safari 26.4) and `tc netem` benchmarks, then propose an upstream `transport-webtransport.md` PR to `MercuryWorkshop/wisp-protocol` reusing Wisp v2's `INFO`, extension, and close-code registries.
+   Ship standalone `wisp-wt` first to validate cross-browser behavior (Chrome, Firefox, Safari 26.4) and `tc netem` benchmarks, then propose an upstream `transport-webtransport.md` PR to `MercuryWorkshop/wisp-protocol` reusing Wisp v2's `INFO`, extension, and close-code registries.
 2. **How does `unkernel`'s `vm.connect()` / network driver interface expose pluggable transports?**  
-   In `pithings/unkernel`, `vm.connect(port)` is for *inbound* host-to-guest `AF_VSOCK` streams. *Outbound* guest networking is cleanly pluggable via `createKernel({ net: NetBackend })` (`js/core/net.ts`), where `NetBackend` requires `connect({ host, port }, events): NetConnection`, `lookup(name): Promise<string[]>`, and `close?(): void`. `@noahbuiltit/wisp-wt/unkernel` implements `NetBackend` directly with zero changes to `unkernel`, upgrading `end()` (real TCP half-close) and `pause()`/`resume()` (real per-stream QUIC backpressure).
+   In `pithings/unkernel`, `vm.connect(port)` is for *inbound* host-to-guest `AF_VSOCK` streams. *Outbound* guest networking is cleanly pluggable via `createKernel({ net: NetBackend })` (`js/core/net.ts`), where `NetBackend` requires `connect({ host, port }, events): NetConnection`, `lookup(name): Promise<string[]>`, and `close?(): void`. `wisp-wt/unkernel` implements `NetBackend` directly with zero changes to `unkernel`, upgrading `end()` (real TCP half-close) and `pause()`/`resume()` (real per-stream QUIC backpressure).
 
 ---
 

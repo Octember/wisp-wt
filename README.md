@@ -50,16 +50,16 @@ Your browser agent or guest VM can call authenticated APIs (like GitHub or OpenA
 
 ## Try It in 30 Seconds
 
-Run the local HTTP/3 + WebSocket Rust relay and the interactive Alpine Linux browser demo:
+Run the local HTTP/3 + WebSocket Rust relay and the interactive Alpine Linux browser demo with a single command:
 
 ```bash
-# 1. Start the local relay (self-signed TLS cert + dev /cert-hash endpoint)
-cargo run --manifest-path relay/Cargo.toml --bin wisp-wt-relay -- \
-  --self-signed --allow-any-origin --dev-http-bind 127.0.0.1:4435
+bun install && bun run dev
+```
 
-# 2. In a second terminal, install dependencies and start the browser demo
-bun install
-bun run demo
+You can also pass extra relay flags (for example, Secretless Auth Proxy routes):
+
+```bash
+bun run dev -- --auth-proxy-config examples/auth-proxy.example.json
 ```
 
 **What you'll see:** Open the printed local URL in Chrome/Edge. The page boots Alpine Linux in `unkernel` over local WebTransport, lets you run real network commands from the browser, and includes a live **"Simulate UDP/443 blocked"** toggle to watch automatic WebSocket fallback in action.
@@ -68,6 +68,12 @@ bun run demo
 
 ## Copy-Paste `unkernel` Integration
 
+Install `wisp-wt`:
+
+```bash
+npm install wisp-wt
+```
+
 Drop `wispWtBackend` into `unkernel` to get HTTP/3 transport, automatic WebSocket fallback, and Secretless Auth Proxy support:
 
 ```ts
@@ -75,8 +81,7 @@ import { createKernel } from "unkernel";
 import { wispWtBackend } from "wisp-wt/unkernel";
 
 const net = wispWtBackend({
-  wtUrl: "https://relay.example.com/",
-  wsUrl: "wss://relay.example.com/",
+  url: "https://relay.example.com/",
   mode: "auto", // WebTransport primary, automatic WebSocket fallback
 });
 

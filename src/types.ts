@@ -76,11 +76,30 @@ export interface WispUdpFlow {
   close(): void;
 }
 
+/**
+ * A server-advertised Secretless Auth Proxy route (`EXT_ID.AUTH_PROXY`).
+ *
+ * @example
+ * ```ts
+ * const route: AuthProxyRoute = { id: "openai", virtualHost: "api.openai.com" };
+ * ```
+ */
 export interface AuthProxyRoute {
+  /** Unique route identifier on the relay. */
   id: string;
+  /** Optional virtual hostname that `wispWtBackend` maps to `openHttpProxy(id)`. */
   virtualHost?: string;
 }
 
+/**
+ * Live telemetry and state snapshot for a `WispClient` session.
+ *
+ * @example
+ * ```ts
+ * const snap = client.stats();
+ * console.log(snap.status, snap.transport, snap.handshakeMs);
+ * ```
+ */
 export interface WispSessionSnapshot {
   status: WispConnectionStatus;
   transport: WispTransportKind | null;
@@ -95,15 +114,55 @@ export interface WispSessionSnapshot {
   authProxyRoutes: readonly AuthProxyRoute[];
 }
 
+/**
+ * Configuration options for {@link WispClient} and {@link wispWtBackend}.
+ *
+ * @example
+ * ```ts
+ * const client = new WispClient({
+ *   url: "https://relay.example.com/",
+ *   authToken: "secret-token",
+ * });
+ * ```
+ */
 export interface WispClientOptions {
+  /**
+   * Base relay URL shorthand. Automatically derives `wtUrl` (`https://`) and
+   * `wsUrl` (`wss://` or `ws://`). Explicit `wtUrl` / `wsUrl` take precedence.
+   */
+  url?: string;
+  /** Explicit WebTransport (HTTP/3) endpoint URL (`https://...`). */
   wtUrl?: string;
+  /** Explicit WebSocket fallback endpoint URL (`wss://...` or `ws://...`). */
   wsUrl?: string;
+  /**
+   * Transport selection strategy.
+   * @default "auto"
+   */
   mode?: WispTransportMode;
+  /**
+   * Happy-Eyeballs delay (ms) before racing WebSocket fallback while WebTransport connects.
+   * @default 350
+   */
   fallbackDelayMs?: number;
+  /**
+   * Overall handshake timeout (ms) before failing `connect()`.
+   * @default 6000
+   */
   handshakeTimeoutMs?: number;
+  /**
+   * Duration (ms) to remember UDP/443 blockage and skip WebTransport.
+   * @default 300000
+   */
   udpBlockedCacheMs?: number;
+  /** Self-signed certificate SHA-256 hashes for local WebTransport dev relays. */
   serverCertificateHashes?: WispServerCertificateHash[];
+  /** Bearer token sent in `EXT_ID.BEARER_AUTH` (and `?token=` on WebSocket). */
   authToken?: string;
+  /**
+   * Wisp protocol version.
+   * @default 2
+   */
   wispVersion?: 1 | 2;
   log?: (msg: string) => void;
   onStateChange?: (snapshot: WispSessionSnapshot) => void;

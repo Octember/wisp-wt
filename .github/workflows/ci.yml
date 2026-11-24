@@ -15,6 +15,11 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run build
+      - run: |
+          if rg -n 'from ["'\'']\./.*\.ts["'\'']' dist; then
+            echo "Found .ts import specifiers in dist/"
+            exit 1
+          fi
       - run: bun test
       - run: npm pack --dry-run
 

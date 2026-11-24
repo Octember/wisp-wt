@@ -1,3 +1,4 @@
+use crate::RelayContext;
 use crate::auth_proxy::{AuthProxy, SessionPrincipal, handle_http_proxy_io};
 use crate::protocol::{
     Extension, InfoPayload, close_reason, control_msg, decode_info, decode_varint,
@@ -25,10 +26,7 @@ const STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn run_wt_server(
     bind: SocketAddr,
     identity: wtransport::Identity,
-    policy: SecurityPolicy,
-    motd: Option<String>,
-    auth_proxy: Option<Arc<AuthProxy>>,
-    disable_raw_tcp: bool,
+    ctx: Arc<RelayContext>,
 ) -> Result<()> {
     let config = ServerConfig::builder()
         .with_bind_address(bind)
@@ -42,26 +40,20 @@ pub async fn run_wt_server(
 
     loop {
         let incoming = server.accept().await;
-        let policy = policy.clone();
-        let motd = motd.clone();
-        let auth_proxy = auth_proxy.clone();
+        let ctx = Arc::clone(&ctx);
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_incoming(incoming, policy, motd, auth_proxy, disable_raw_tcp).await
-            {
+            if let Err(err) = handle_incoming(incoming, ctx).await {
                 debug!(?err, "WebTransport session ended");
             }
         });
     }
 }
 
-async fn handle_incoming(
-    incoming: IncomingSession,
-    policy: SecurityPolicy,
-    motd: Option<String>,
-    auth_proxy: Option<Arc<AuthProxy>>,
-    disable_raw_tcp: bool,
-) -> Result<()> {
+async fn handle_incoming(incoming: IncomingSession, ctx: Arc<RelayContext>) -> Result<()> {
+    let policy = &ctx.policy;
+    let motd = ctx.motd.as_deref();
+    let auth_proxy = ctx.auth_proxy.as_ref();
+    let disable_raw_tcp = ctx.disable_raw_tcp;
     let req = incoming.await?;
     let remote_ip = req.remote_address().ip();
     let origin = req.origin().map(str::to_string);
@@ -90,7 +82,15 @@ async fn handle_incoming(
     }
 
     let conn = req.accept().await?;
-    run_wt_session(conn, policy, motd, http_token, auth_proxy, disable_raw_tcp).await
+    run_wt_session(
+        conn,
+        policy.clone(),
+        motd.map(str::to_string),
+        http_token,
+        auth_proxy.cloned(),
+        disable_raw_tcp,
+    )
+    .await
 }
 
 struct UdpFlow {
@@ -499,47 +499,28 @@ async fn handle_udp_bind(
         return Ok(());
     }
     let flow_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-    if flow_id >= (1 << 30) {
-        send_udp_ctrl(
-            ctrl_send,
-            control_msg::UDP_BOUND,
-            flow_id,
-            close_reason::INVALID_INFO,
-        )
-        .await?;
-        return Ok(());
-    }
-    if udp_flows.lock().await.len() >= policy.max_streams_per_session {
-        send_udp_ctrl(
-            ctrl_send,
-            control_msg::UDP_BOUND,
-            flow_id,
-            close_reason::THROTTLED,
-        )
-        .await?;
-        return Ok(());
+    let fail_reason = if flow_id >= (1 << 30)
+        || payload.len() < 8 + u16::from_le_bytes(payload[6..8].try_into().unwrap()) as usize
+    {
+        Some(close_reason::INVALID_INFO)
+    } else if udp_flows.lock().await.len() >= policy.max_streams_per_session {
+        Some(close_reason::THROTTLED)
+    } else {
+        None
+    };
+    if let Some(reason) = fail_reason {
+        return send_udp_ctrl(ctrl_send, control_msg::UDP_BOUND, flow_id, reason).await;
     }
     let port = u16::from_le_bytes(payload[4..6].try_into().unwrap());
     let host_len = u16::from_le_bytes(payload[6..8].try_into().unwrap()) as usize;
-    if payload.len() < 8 + host_len {
-        send_udp_ctrl(
-            ctrl_send,
-            control_msg::UDP_BOUND,
-            flow_id,
-            close_reason::INVALID_INFO,
-        )
-        .await?;
-        return Ok(());
-    }
     let Ok(host) = std::str::from_utf8(&payload[8..8 + host_len]) else {
-        send_udp_ctrl(
+        return send_udp_ctrl(
             ctrl_send,
             control_msg::UDP_BOUND,
             flow_id,
             close_reason::INVALID_INFO,
         )
-        .await?;
-        return Ok(());
+        .await;
     };
 
     let sock = match connect_udp(host, port, policy).await {

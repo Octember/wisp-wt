@@ -1,0 +1,35 @@
+{
+  "routes": [
+    {
+      "id": "github",
+      "upstream": "https://api.github.com",
+      "virtual_host": "github.internal",
+      "allowed_methods": ["GET", "POST"],
+      "allowed_paths": ["/user", "/repos/*"],
+      "inject_headers": {
+        "authorization": "Bearer ${GITHUB_TOKEN}",
+        "user-agent": "wisp-wt-auth-proxy"
+      },
+      "strip_request_headers": ["authorization", "cookie"],
+      "strip_response_headers": ["set-cookie"]
+    },
+    {
+      "id": "openai",
+      "upstream": "https://api.openai.com/v1",
+      "virtual_host": "openai.internal",
+      "allowed_methods": ["POST"],
+      "allowed_paths": ["/responses", "/chat/completions"],
+      "inject_headers": {
+        "authorization": "Bearer ${OPENAI_API_KEY}"
+      },
+      "strip_request_headers": ["authorization"]
+    }
+  ],
+  "principals": [
+    {
+      "token": "${WISP_CLIENT_TOKEN}",
+      "allowed_routes": ["github", "openai"],
+      "allow_raw_tcp": false
+    }
+  ]
+}

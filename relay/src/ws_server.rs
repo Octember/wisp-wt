@@ -1,3 +1,4 @@
+use crate::RelayContext;
 use crate::auth_proxy::{AuthProxy, handle_http_proxy_io};
 use crate::protocol::{
     Extension, InfoPayload, close_reason, decode_info, encode_info, encode_ws_packet, ext_id,
@@ -28,10 +29,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn run_ws_server(
     bind: SocketAddr,
     tls_config: Option<Arc<rustls::ServerConfig>>,
-    policy: SecurityPolicy,
-    motd: Option<String>,
-    auth_proxy: Option<Arc<AuthProxy>>,
-    disable_raw_tcp: bool,
+    ctx: Arc<RelayContext>,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
@@ -43,22 +41,17 @@ pub async fn run_ws_server(
     loop {
         let (stream, peer) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
-        let policy = policy.clone();
-        let motd = motd.clone();
+        let ctx = Arc::clone(&ctx);
         let acceptor = tls_acceptor.clone();
-        let auth_proxy = auth_proxy.clone();
         tokio::spawn(async move {
             let res = if let Some(acc) = acceptor {
                 match tokio::time::timeout(HANDSHAKE_TIMEOUT, acc.accept(stream)).await {
-                    Ok(Ok(tls_stream)) => {
-                        handle_ws_conn(tls_stream, peer, policy, motd, auth_proxy, disable_raw_tcp)
-                            .await
-                    }
+                    Ok(Ok(tls_stream)) => handle_ws_conn(tls_stream, peer, ctx).await,
                     Ok(Err(e)) => Err(e.into()),
                     Err(_) => Err(anyhow::anyhow!("WebSocket TLS handshake timed out")),
                 }
             } else {
-                handle_ws_conn(stream, peer, policy, motd, auth_proxy, disable_raw_tcp).await
+                handle_ws_conn(stream, peer, ctx).await
             };
             if let Err(err) = res {
                 debug!(?err, %peer, "WebSocket session ended");
@@ -72,18 +65,17 @@ async fn finish_writer(out_tx: mpsc::Sender<Vec<u8>>, writer_task: JoinHandle<()
     let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
 }
 
-async fn handle_ws_conn<S>(
-    stream: S,
-    peer: SocketAddr,
-    policy: SecurityPolicy,
-    motd: Option<String>,
-    auth_proxy: Option<Arc<AuthProxy>>,
-    disable_raw_tcp: bool,
-) -> Result<()>
+async fn handle_ws_conn<S>(stream: S, peer: SocketAddr, ctx: Arc<RelayContext>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let policy = &ctx.policy;
+    let motd = ctx.motd.as_deref();
+    let auth_proxy = ctx.auth_proxy.as_ref();
+    let disable_raw_tcp = ctx.disable_raw_tcp;
+
     let Some(_permit) = policy.try_acquire_session(peer.ip()) else {
+        warn!(%peer, "Rejected WebSocket session: rate limit");
         return Ok(());
     };
 
@@ -116,6 +108,7 @@ where
             let token = extract_http_token(path, auth_hdr);
             if token.is_some() {
                 if !policy.verify_token(token.as_deref()) {
+                    warn!(%peer, "Rejected WebSocket session: invalid HTTP token");
                     return Err(ErrorResponse::new(Some("Unauthorized".into())));
                 }
                 http_token = token;
@@ -163,7 +156,7 @@ where
         if let Some(m) = motd {
             exts.push(Extension {
                 id: ext_id::MOTD,
-                data: m.into_bytes(),
+                data: m.as_bytes().to_vec(),
             });
         }
         let info_bytes = encode_info(&InfoPayload {
@@ -203,7 +196,7 @@ where
                 _ => None,
             };
             if let Some(r) = reason {
-                let _ = out_tx.send(encode_ws_packet(ws_pkt::CLOSE, 0, &[r])).await;
+                send_ws_close(&out_tx, 0, r).await;
                 finish_writer(out_tx, writer_task).await;
                 return Ok(());
             }
@@ -283,9 +276,7 @@ where
                     } else {
                         close_reason::THROTTLED
                     };
-                    let _ = out_tx
-                        .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[reason]))
-                        .await;
+                    send_ws_close(&out_tx, stream_id, reason).await;
                     continue;
                 }
                 let stype = payload[0];
@@ -337,7 +328,7 @@ where
                     ),
                     ws_stream_type::HTTP_PROXY => {
                         let (ap, route) = match AuthProxy::authorize_route(
-                            auth_proxy.as_ref(),
+                            auth_proxy,
                             principal.as_deref(),
                             host,
                         ) {

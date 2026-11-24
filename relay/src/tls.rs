@@ -36,7 +36,9 @@ pub fn load_or_generate_tls(
     } else if self_signed {
         generate_self_signed(extra_sans)?
     } else {
-        bail!("Provide --cert and --key, or pass --self-signed for local development");
+        bail!(
+            "TLS configuration required: provide --cert and --key, or pass --self-signed / --dev for local development"
+        );
     };
 
     let leaf = certs

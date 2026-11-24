@@ -1,4 +1,4 @@
-export { WispClient } from "./client.ts";
+export { WispClient } from "./client.js";
 export {
   CONTROL_MSG,
   EXT_ID,
@@ -22,7 +22,7 @@ export {
   encodeWsConnectPayload,
   encodeWsPacket,
   varintLength,
-} from "./protocol.ts";
+} from "./protocol.js";
 export type {
   AuthProxyRoute,
   WebSocketConstructor,
@@ -42,13 +42,13 @@ export type {
   WispTransportMode,
   WispUdpFlow,
   WispUdpFlowEvents,
-} from "./types.ts";
+} from "./types.js";
 export {
   wispWtBackend,
   type UnkernelNetBackend,
   type UnkernelNetConnection,
   type UnkernelNetConnectionEvents,
   type WispWtBackend,
-} from "./unkernel.ts";
-export { WispWebSocketSession } from "./ws-session.ts";
-export { WispWebTransportSession } from "./wt-session.ts";
+} from "./unkernel.js";
+export { WispWebSocketSession } from "./ws-session.js";
+export { WispWebTransportSession } from "./wt-session.js";

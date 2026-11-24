@@ -8,13 +8,13 @@ use std::path::PathBuf;
     about = "Dual-stack WebTransport + WebSocket Wisp relay"
 )]
 pub struct RelayConfig {
-    /// UDP bind address for HTTP/3 WebTransport
+    /// UDP bind address for HTTP/3 WebTransport (host:port or ip:port)
     #[arg(long, env = "WISP_WT_BIND", default_value = "127.0.0.1:4433")]
-    pub wt_bind: SocketAddr,
+    pub wt_bind: String,
 
-    /// TCP bind address for WebSocket fallback
+    /// TCP bind address for WebSocket fallback (host:port or ip:port)
     #[arg(long, env = "WISP_WS_BIND", default_value = "127.0.0.1:4434")]
-    pub ws_bind: SocketAddr,
+    pub ws_bind: String,
 
     /// Enable TLS (wss://) on the WebSocket listener using the same cert/key
     #[arg(long, env = "WISP_WS_TLS", default_value_t = false)]
@@ -103,13 +103,34 @@ pub struct RelayConfig {
     /// Disable raw TCP (0x01) streams when operating as an auth-proxy-only relay
     #[arg(long, env = "WISP_DISABLE_RAW_TCP", default_value_t = false)]
     pub disable_raw_tcp: bool,
+
+    /// Local development preset: enables --self-signed (unless --cert/--key provided),
+    /// --allow-any-origin, and --dev-http-bind 127.0.0.1:4435 (if unset)
+    #[arg(long, env = "WISP_DEV", default_value_t = false)]
+    pub dev: bool,
+}
+
+impl RelayConfig {
+    /// Apply `--dev` preset defaults when `self.dev` is true.
+    pub fn apply_dev_preset(&mut self) {
+        if !self.dev {
+            return;
+        }
+        if self.cert.is_none() && self.key.is_none() {
+            self.self_signed = true;
+        }
+        self.allow_any_origin = true;
+        if self.dev_http_bind.is_none() {
+            self.dev_http_bind = Some("127.0.0.1:4435".parse().expect("valid socket addr"));
+        }
+    }
 }
 
 impl Default for RelayConfig {
     fn default() -> Self {
         Self {
-            wt_bind: "127.0.0.1:4433".parse().unwrap(),
-            ws_bind: "127.0.0.1:4434".parse().unwrap(),
+            wt_bind: "127.0.0.1:4433".to_string(),
+            ws_bind: "127.0.0.1:4434".to_string(),
             ws_tls: false,
             dev_http_bind: None,
             cert: None,
@@ -131,6 +152,7 @@ impl Default for RelayConfig {
             motd: None,
             auth_proxy_config: None,
             disable_raw_tcp: false,
+            dev: false,
         }
     }
 }

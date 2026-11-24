@@ -41,10 +41,13 @@
     "url": "https://github.com/noahbuiltit/wisp-wt/issues"
   },
   "scripts": {
+    "dev": "bun scripts/dev.ts",
+    "relay": "cargo run --manifest-path relay/Cargo.toml -- --dev",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "prepublishOnly": "bun run build",
+    "check": "bun run typecheck && bun test && (cd relay && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test)",
+    "prepublishOnly": "bun run typecheck && bun run build && bun test",
     "demo": "bun demo/server.ts",
     "verify:unkernel": "bun scripts/verify-unkernel.ts"
   },

@@ -20,6 +20,7 @@ use tracing::{info, warn};
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthProxyRouteConfig {
     pub id: String,
     pub upstream: String,
@@ -38,6 +39,7 @@ pub struct AuthProxyRouteConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalConfig {
     pub token: String,
     #[serde(default)]
@@ -47,6 +49,7 @@ pub struct PrincipalConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthProxyFileConfig {
     #[serde(default)]
     pub routes: Vec<AuthProxyRouteConfig>,
@@ -107,9 +110,29 @@ impl AuthProxy {
         let mut routes = HashMap::new();
         let mut route_order = Vec::new();
         for r in cfg.routes {
+            if r.id.trim().is_empty() {
+                bail!("Auth proxy route id must not be empty");
+            }
+            if routes.contains_key(&r.id) {
+                bail!("Duplicate auth proxy route id '{}'", r.id);
+            }
             let compiled = compile_route(r)?;
             route_order.push(compiled.id.clone());
             routes.insert(compiled.id.clone(), Arc::new(compiled));
+        }
+
+        let mut principals = Vec::with_capacity(cfg.principals.len());
+        for (idx, mut p) in cfg.principals.into_iter().enumerate() {
+            p.token = expand_env_vars(&p.token)
+                .with_context(|| format!("Failed to expand token for principal #{idx}"))?;
+            for route_id in &p.allowed_routes {
+                if !routes.contains_key(route_id) {
+                    bail!(
+                        "Principal #{idx} references unknown route id '{route_id}' in allowed_routes"
+                    );
+                }
+            }
+            principals.push(p);
         }
 
         let mut root_store = rustls::RootCertStore::empty();
@@ -119,10 +142,16 @@ impl AuthProxy {
             .with_no_client_auth();
         let tls_connector = TlsConnector::from(Arc::new(tls_cfg));
 
+        info!(
+            routes = routes.len(),
+            principals = principals.len(),
+            "Loaded auth proxy config"
+        );
+
         Ok(Self {
             routes,
             route_order,
-            principals: cfg.principals,
+            principals,
             tls_connector,
         })
     }
@@ -265,7 +294,8 @@ fn compile_route(r: AuthProxyRouteConfig) -> Result<CompiledRoute> {
     for (k, v) in r.inject_headers {
         let name = HeaderName::from_bytes(k.as_bytes())
             .with_context(|| format!("Invalid inject header name '{k}'"))?;
-        let expanded = expand_env_vars(&v)?;
+        let expanded = expand_env_vars(&v)
+            .with_context(|| format!("Route '{}' inject_headers['{k}']", r.id))?;
         let val = HeaderValue::from_str(&expanded)
             .with_context(|| format!("Invalid inject header value for '{k}'"))?;
         inject_headers.push((name, val));

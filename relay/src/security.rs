@@ -1,7 +1,5 @@
 use crate::config::RelayConfig;
-use crate::protocol::{
-    Extension, InfoPayload, close_reason, encode_info, ext_id, extract_token_from_info,
-};
+use crate::protocol::close_reason;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Deref;
@@ -234,30 +232,6 @@ impl SecurityPolicy {
 
     pub fn new_stream_limiter(&self) -> StreamRateLimiter {
         StreamRateLimiter::new(self.streams_per_sec, self.streams_burst)
-    }
-
-    pub fn check_info_auth(&self, http_token: Option<&str>, info: &InfoPayload) -> bool {
-        if !self.requires_auth() || http_token.is_some() {
-            return true;
-        }
-        let info_token = extract_token_from_info(info);
-        self.verify_token(info_token.as_deref())
-    }
-
-    pub fn build_server_info(&self, version_major: u8, version_minor: u8) -> Vec<u8> {
-        let extensions = if self.requires_auth() {
-            vec![Extension {
-                id: ext_id::PASSWORD_AUTH,
-                data: Vec::new(),
-            }]
-        } else {
-            Vec::new()
-        };
-        encode_info(&InfoPayload {
-            major: version_major,
-            minor: version_minor,
-            extensions,
-        })
     }
 }
 

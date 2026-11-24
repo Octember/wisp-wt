@@ -3,7 +3,7 @@ import { fetchDistro } from "unkernel/node";
 
 const DEMO_DIR = resolve(import.meta.dir);
 const PKG_DIR = resolve(DEMO_DIR, "..");
-const PORT = Number(process.env.DEMO_PORT ?? "4173");
+const PORT = Number(process.env.PORT ?? process.env.DEMO_PORT ?? "4173");
 const RELAY_INFO_URL = process.env.RELAY_INFO_URL ?? "http://127.0.0.1:4435/cert-hash";
 
 const COOP_COEP_HEADERS: Record<string, string> = {

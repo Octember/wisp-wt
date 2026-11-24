@@ -14,7 +14,7 @@ import {
   parseServerInfo,
   toError,
   utf8Encode,
-} from "./protocol.ts";
+} from "./protocol.js";
 import type {
   AuthProxyRoute,
   WebSocketConstructor,
@@ -25,7 +25,7 @@ import type {
   WispTcpStreamEvents,
   WispUdpFlow,
   WispUdpFlowEvents,
-} from "./types.ts";
+} from "./types.js";
 
 const MAX_PACKET = 64 * 1024;
 
@@ -91,12 +91,28 @@ export class WispWebSocketSession implements WispSession {
       return Promise.reject(new Error("WebSocket is not available in this environment"));
     }
 
+    let connectUrl = url;
+    if (opts.authToken) {
+      try {
+        const parsed = new URL(url);
+        if (!parsed.searchParams.has("token")) {
+          parsed.searchParams.set("token", opts.authToken);
+          connectUrl = parsed.toString();
+        }
+      } catch {
+        const sep = url.includes("?") ? "&" : "?";
+        if (!/[?&]token=/.test(url)) {
+          connectUrl = `${url}${sep}token=${encodeURIComponent(opts.authToken)}`;
+        }
+      }
+    }
+
     return new Promise<WispWebSocketSession>((resolve, reject) => {
       let settled = false;
       let motd: string | null = null;
       let authProxyRoutes: AuthProxyRoute[] = [];
       const useV2 = (opts.wispVersion ?? 2) === 2;
-      const ws = useV2 ? new WS(url, ["wisp-v2"]) : new WS(url);
+      const ws = useV2 ? new WS(connectUrl, ["wisp-v2"]) : new WS(connectUrl);
       ws.binaryType = "arraybuffer";
 
       const fail = (err: Error) => {
@@ -110,8 +126,13 @@ export class WispWebSocketSession implements WispSession {
         reject(err);
       };
 
-      ws.onerror = () => fail(new Error("WebSocket connection failed"));
-      ws.onclose = () => fail(new Error("WebSocket closed during handshake"));
+      ws.onerror = () => fail(new Error(`WebSocket connection to ${connectUrl} failed`));
+      ws.onclose = (ev: unknown) => {
+        const closeEv = ev as { code?: number; reason?: string } | undefined;
+        const code = closeEv?.code ?? 1006;
+        const reason = closeEv?.reason ? `, reason=${closeEv.reason}` : "";
+        fail(new Error(`WebSocket closed during handshake (${connectUrl}, code=${code}${reason})`));
+      };
       ws.onmessage = (e) => {
         const m = toUint8Array(e.data);
         if (m.length < 5) return;

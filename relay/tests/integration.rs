@@ -81,21 +81,27 @@ async fn wt_tcp_concurrent_and_udp_echo() -> Result<()> {
     let hash = Sha256Digest::new(tls.cert_sha256);
     let policy = SecurityPolicy::from_config(&cfg);
 
+    let wt_ctx = std::sync::Arc::new(wisp_wt_relay::RelayContext {
+        policy: policy.clone(),
+        motd: Some("test-motd".into()),
+        auth_proxy: None,
+        disable_raw_tcp: false,
+    });
     tokio::spawn(wt_server::run_wt_server(
-        cfg.wt_bind,
+        cfg.wt_bind.parse().unwrap(),
         tls.identity,
-        policy.clone(),
-        Some("test-motd".into()),
-        None,
-        false,
+        wt_ctx,
     ));
-    tokio::spawn(ws_server::run_ws_server(
-        cfg.ws_bind,
-        None,
+    let ws_ctx = std::sync::Arc::new(wisp_wt_relay::RelayContext {
         policy,
+        motd: None,
+        auth_proxy: None,
+        disable_raw_tcp: false,
+    });
+    tokio::spawn(ws_server::run_ws_server(
+        cfg.ws_bind.parse().unwrap(),
         None,
-        None,
-        false,
+        ws_ctx,
     ));
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -242,12 +248,14 @@ async fn ssrf_blocks_loopback_when_disabled() -> Result<()> {
     let hash = Sha256Digest::new(tls.cert_sha256);
     let policy = SecurityPolicy::from_config(&cfg);
     tokio::spawn(wt_server::run_wt_server(
-        cfg.wt_bind,
+        cfg.wt_bind.parse().unwrap(),
         tls.identity,
-        policy,
-        None,
-        None,
-        false,
+        std::sync::Arc::new(wisp_wt_relay::RelayContext {
+            policy,
+            motd: None,
+            auth_proxy: None,
+            disable_raw_tcp: false,
+        }),
     ));
     tokio::time::sleep(Duration::from_millis(60)).await;
 
@@ -396,12 +404,14 @@ async fn wt_fragmented_control_frames() -> anyhow::Result<()> {
     let cert_hash = tls.cert_sha256;
     let policy = SecurityPolicy::from_config(&cfg);
     tokio::spawn(wt_server::run_wt_server(
-        cfg.wt_bind,
+        cfg.wt_bind.parse().unwrap(),
         tls.identity,
-        policy,
-        None,
-        None,
-        false,
+        std::sync::Arc::new(wisp_wt_relay::RelayContext {
+            policy,
+            motd: None,
+            auth_proxy: None,
+            disable_raw_tcp: false,
+        }),
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -506,12 +516,14 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
     let auth_proxy =
         std::sync::Arc::new(wisp_wt_relay::auth_proxy::AuthProxy::from_file(&cfg_path)?);
     tokio::spawn(wt_server::run_wt_server(
-        cfg.wt_bind,
+        cfg.wt_bind.parse().unwrap(),
         tls.identity,
-        policy,
-        None,
-        Some(auth_proxy),
-        true,
+        std::sync::Arc::new(wisp_wt_relay::RelayContext {
+            policy,
+            motd: None,
+            auth_proxy: Some(auth_proxy),
+            disable_raw_tcp: true,
+        }),
     ));
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -619,8 +631,17 @@ async fn ws_stream_id_replacement_safety() -> Result<()> {
     drop(ws_listener);
 
     tokio::spawn(async move {
-        let _ =
-            wisp_wt_relay::ws_server::run_ws_server(ws_addr, None, policy, None, None, false).await;
+        let _ = wisp_wt_relay::ws_server::run_ws_server(
+            ws_addr,
+            None,
+            std::sync::Arc::new(wisp_wt_relay::RelayContext {
+                policy,
+                motd: None,
+                auth_proxy: None,
+                disable_raw_tcp: false,
+            }),
+        )
+        .await;
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -703,10 +724,12 @@ async fn wt_udp_close_is_5_bytes() -> Result<()> {
         let _ = wisp_wt_relay::wt_server::run_wt_server(
             wt_addr,
             tls.identity,
-            policy,
-            None,
-            None,
-            false,
+            std::sync::Arc::new(wisp_wt_relay::RelayContext {
+                policy,
+                motd: None,
+                auth_proxy: None,
+                disable_raw_tcp: false,
+            }),
         )
         .await;
     });
@@ -764,4 +787,96 @@ async fn wt_udp_close_is_5_bytes() -> Result<()> {
     );
     assert_eq!(close_payload[4], close_reason::NETWORK_ERROR);
     Ok(())
+}
+
+#[test]
+fn dev_preset_applies_expected_defaults() {
+    let mut cfg = RelayConfig {
+        dev: true,
+        self_signed: false,
+        allow_any_origin: false,
+        dev_http_bind: None,
+        ..Default::default()
+    };
+    cfg.apply_dev_preset();
+    assert!(cfg.self_signed);
+    assert!(cfg.allow_any_origin);
+    assert_eq!(
+        cfg.dev_http_bind,
+        Some("127.0.0.1:4435".parse().expect("valid addr"))
+    );
+
+    // Explicit --cert/--key should not force self_signed even with --dev.
+    let mut cfg_with_cert = RelayConfig {
+        dev: true,
+        self_signed: false,
+        cert: Some(std::path::PathBuf::from("/tmp/cert.pem")),
+        key: Some(std::path::PathBuf::from("/tmp/key.pem")),
+        ..Default::default()
+    };
+    cfg_with_cert.apply_dev_preset();
+    assert!(!cfg_with_cert.self_signed);
+    assert!(cfg_with_cert.allow_any_origin);
+}
+
+#[tokio::test]
+async fn hostname_bind_resolution_in_run_relay() {
+    let cfg = RelayConfig {
+        wt_bind: "localhost:0".to_string(),
+        ws_bind: "localhost:0".to_string(),
+        self_signed: true,
+        allow_any_origin: true,
+        ..Default::default()
+    };
+    let handle = tokio::spawn(async move { wisp_wt_relay::run_relay(cfg).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!handle.is_finished(), "run_relay exited unexpectedly");
+    handle.abort();
+}
+
+#[test]
+fn auth_proxy_config_validation_rejects_unknown_duplicate_and_missing_env() {
+    let dir = std::env::temp_dir();
+
+    // 1. deny_unknown_fields
+    let unknown_path = dir.join("wisp-wt-test-unknown-field.json");
+    std::fs::write(&unknown_path, r#"{"routes": [], "unexpected_field": true}"#).unwrap();
+    let err = wisp_wt_relay::auth_proxy::AuthProxy::from_file(&unknown_path)
+        .err()
+        .unwrap();
+    let _ = std::fs::remove_file(&unknown_path);
+    assert!(format!("{err:#}").contains("unknown field"));
+
+    // 2. Duplicate route IDs
+    let dup_path = dir.join("wisp-wt-test-dup-route.json");
+    std::fs::write(
+        &dup_path,
+        r#"{"routes": [
+            {"id": "api", "upstream": "https://example.com"},
+            {"id": "api", "upstream": "https://example.org"}
+        ]}"#,
+    )
+    .unwrap();
+    let err = wisp_wt_relay::auth_proxy::AuthProxy::from_file(&dup_path)
+        .err()
+        .unwrap();
+    let _ = std::fs::remove_file(&dup_path);
+    assert!(format!("{err:#}").contains("Duplicate auth proxy route id"));
+
+    // 3. Missing ${ENV_VAR} in inject_headers with route/header context
+    let env_path = dir.join("wisp-wt-test-missing-env.json");
+    std::fs::write(
+        &env_path,
+        r#"{"routes": [
+            {"id": "gh", "upstream": "https://api.github.com", "inject_headers": {"authorization": "Bearer ${WISP_NONEXISTENT_TEST_VAR_XYZ}"}}
+        ]}"#,
+    )
+    .unwrap();
+    let err = wisp_wt_relay::auth_proxy::AuthProxy::from_file(&env_path)
+        .err()
+        .unwrap();
+    let _ = std::fs::remove_file(&env_path);
+    let msg = format!("{err:#}");
+    assert!(msg.contains("Route 'gh' inject_headers['authorization']"));
+    assert!(msg.contains("WISP_NONEXISTENT_TEST_VAR_XYZ"));
 }

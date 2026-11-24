@@ -4,10 +4,21 @@ app = "wisp-wt-relay"
 primary_region = "sea"
 
 [build]
-dockerfile = "Dockerfile.relay"
+dockerfile = "deploy/Dockerfile.relay"
 
 [env]
 RUST_LOG = "info"
+# Required on Fly.io for UDP WebTransport:
+WISP_WT_BIND = "fly-global-services:443"
+WISP_WS_BIND = "0.0.0.0:443"
+WISP_WS_TLS = "true"
+# Set allowed browser origins (comma-separated) and TLS cert/key paths (or mount secrets):
+# WISP_ALLOW_ORIGINS = "https://app.example.com"
+# WISP_CERT = "/etc/wisp-wt/fullchain.pem"
+# WISP_KEY = "/etc/wisp-wt/privkey.pem"
+# Optional secretless auth proxy & raw-TCP lockdown:
+# WISP_AUTH_PROXY_CONFIG = "/etc/wisp-wt/auth-proxy.json"
+# WISP_DISABLE_RAW_TCP = "true"
 
 [[services]]
 protocol = "udp"

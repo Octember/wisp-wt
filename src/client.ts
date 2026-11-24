@@ -1,4 +1,4 @@
-import { getGlobalCtor, toError } from "./protocol.ts";
+import { getGlobalCtor, toError, WISP_CLOSE_REASON, WispCloseError } from "./protocol.js";
 import type {
   WebTransportConstructor,
   WispClientOptions,
@@ -11,14 +11,44 @@ import type {
   WispTransportMode,
   WispUdpFlow,
   WispUdpFlowEvents,
-} from "./types.ts";
-import { WispWebSocketSession } from "./ws-session.ts";
-import { WispWebTransportSession } from "./wt-session.ts";
+} from "./types.js";
+import { WispWebSocketSession } from "./ws-session.js";
+import { WispWebTransportSession } from "./wt-session.js";
 
 const DEFAULT_FALLBACK_DELAY_MS = 1500;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const DEFAULT_UDP_BLOCKED_CACHE_MS = 60_000;
 
+function normalizeClientOptions(opts: WispClientOptions): WispClientOptions {
+  if (!opts.url && !opts.wtUrl && !opts.wsUrl) {
+    throw new TypeError("WispClient requires at least one of `url`, `wtUrl`, or `wsUrl`");
+  }
+  if (!opts.url) {
+    return { ...opts };
+  }
+  const parsed = new URL(opts.url);
+  const isInsecure = parsed.protocol === "http:" || parsed.protocol === "ws:";
+  const wtParsed = new URL(parsed.toString());
+  wtParsed.protocol = "https:";
+  const wsParsed = new URL(parsed.toString());
+  wsParsed.protocol = isInsecure ? "ws:" : "wss:";
+  return {
+    ...opts,
+    wtUrl: opts.wtUrl ?? wtParsed.toString(),
+    wsUrl: opts.wsUrl ?? wsParsed.toString(),
+  };
+}
+
+/**
+ * High-level Wisp client with automatic HTTP/3 WebTransport and WebSocket
+ * Happy-Eyeballs fallback, UDP-blocked caching, and Secretless Auth Proxy support.
+ *
+ * @example
+ * ```ts
+ * const client = new WispClient({ url: "https://relay.example.com/" });
+ * const session = await client.connect();
+ * ```
+ */
 export class WispClient {
   private opts: WispClientOptions;
   private session: WispSession | null = null;
@@ -31,7 +61,7 @@ export class WispClient {
   private generation = 0;
 
   constructor(opts: WispClientOptions) {
-    this.opts = { ...opts };
+    this.opts = normalizeClientOptions(opts);
   }
 
   setMode(mode: WispTransportMode): void {
@@ -42,7 +72,7 @@ export class WispClient {
   }
 
   updateOptions(patch: Partial<WispClientOptions>): void {
-    this.opts = { ...this.opts, ...patch };
+    this.opts = normalizeClientOptions({ ...this.opts, ...patch });
     this.udpBlockedUntil = 0;
     this.close();
   }
@@ -115,7 +145,7 @@ export class WispClient {
     return this.openStreamWithConnect((sess) => sess.openHttpProxy(routeId, events), events);
   }
 
-  private openStreamWithConnect(
+  openStreamWithConnect(
     openOnSession: (sess: WispSession) => WispTcpStream,
     events: WispTcpStreamEvents,
   ): WispTcpStream {
@@ -143,7 +173,7 @@ export class WispClient {
       (err) => {
         if (!destroyed) {
           destroyed = true;
-          events.onClose(err instanceof Error ? err : new Error(String(err)));
+          events.onClose(toError(err));
         }
       },
     );
@@ -373,7 +403,7 @@ export class WispClient {
             finishWin(s, wtSession, reason);
           },
           (e) => {
-            wsErr = e instanceof Error ? e : new Error(String(e));
+            wsErr = toError(e);
             checkBothFailed();
           },
         );
@@ -389,7 +419,17 @@ export class WispClient {
         clearTimeout(fallbackTimer);
         wtSession?.close();
         wsSession?.close();
-        reject(new Error("Wisp handshake timed out"));
+        const details = [
+          wtErr ? `wt: ${wtErr.message}` : null,
+          wsErr ? `ws: ${wsErr.message}` : null,
+        ]
+          .filter(Boolean)
+          .join("; ");
+        reject(
+          new Error(
+            `Wisp handshake timed out after ${timeoutMs}ms${details ? ` (${details})` : ""}`,
+          ),
+        );
       }, timeoutMs);
 
       connectWt().then(
@@ -398,7 +438,27 @@ export class WispClient {
           finishWin(s, wsSession, null);
         },
         (e) => {
-          wtErr = e instanceof Error ? e : new Error(String(e));
+          wtErr = toError(e);
+          const closeErr =
+            wtErr instanceof WispCloseError
+              ? wtErr
+              : wtErr.cause instanceof WispCloseError
+                ? wtErr.cause
+                : null;
+          if (
+            closeErr &&
+            (closeErr.reason === WISP_CLOSE_REASON.AUTH_REQUIRED ||
+              closeErr.reason === WISP_CLOSE_REASON.AUTH_INVALID_PASSWORD)
+          ) {
+            if (!settled) {
+              settled = true;
+              clearTimeout(fallbackTimer);
+              clearTimeout(overallTimer);
+              wsSession?.close();
+              reject(wtErr);
+            }
+            return;
+          }
           if (!wsStarted && wsUrl) {
             clearTimeout(fallbackTimer);
             startWs(`WebTransport failed: ${wtErr.message}`);

@@ -1,5 +1,5 @@
-import { WispClient } from "./client.ts";
-import type { WispClientOptions, WispSessionSnapshot, WispTransportMode } from "./types.ts";
+import { WispClient } from "./client.js";
+import type { WispClientOptions, WispSessionSnapshot, WispTransportMode } from "./types.js";
 
 /** Structural match for unkernel's NetConnectionEvents (js/core/net.ts). */
 export interface UnkernelNetConnectionEvents {
@@ -50,9 +50,18 @@ const ip4 = (s: string) => s.split(".").reduce((a, b) => ((a << 8) | Number(b)) 
 /**
  * Creates a drop-in unkernel `NetBackend` backed by Wisp-over-WebTransport
  * with automatic Wisp-over-WebSocket fallback.
+ *
+ * @example
+ * ```ts
+ * const net = wispWtBackend("https://relay.example.com/");
+ * // or with options:
+ * const netWithAuth = wispWtBackend({ url: "https://relay.example.com/", authToken: "secret" });
+ * ```
  */
-export function wispWtBackend(options: WispClientOptions): WispWtBackend {
-  const client = new WispClient(options);
+export function wispWtBackend(options: WispClientOptions | string): WispWtBackend {
+  const normalizedOptions: WispClientOptions =
+    typeof options === "string" ? { url: options } : options;
+  const client = new WispClient(normalizedOptions);
   const nameToIp = new Map<string, number>();
   const ipToName = new Map<number, string>();
   let nextFake = 1;
@@ -61,13 +70,15 @@ export function wispWtBackend(options: WispClientOptions): WispWtBackend {
     client,
     connect({ host, port }, ev): UnkernelNetConnection {
       const resolvedHost = isIPv4(host) ? (ipToName.get(ip4(host)) ?? host) : host.toLowerCase();
-      const proxyRoute = client
-        .stats()
-        .authProxyRoutes.find((r) => r.virtualHost?.toLowerCase() === resolvedHost);
-      if (proxyRoute) {
-        return client.openHttpProxy(proxyRoute.id, ev);
-      }
-      return client.openTcpStream(resolvedHost, port, ev);
+      return client.openStreamWithConnect((sess) => {
+        const proxyRoute = sess.authProxyRoutes.find(
+          (r) => r.virtualHost?.toLowerCase() === resolvedHost,
+        );
+        if (proxyRoute) {
+          return sess.openHttpProxy(proxyRoute.id, ev);
+        }
+        return sess.openTcpStream(resolvedHost, port, ev);
+      }, ev);
     },
     lookup(name: string): Promise<string[]> {
       const normalized = name.trim().toLowerCase();

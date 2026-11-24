@@ -1,4 +1,4 @@
-import type { AuthProxyRoute } from "./types.ts";
+import type { AuthProxyRoute } from "./types.js";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -82,6 +82,16 @@ export function describeCloseReason(reason: number): string {
   return CLOSE_REASON_LABELS[reason] ?? `close reason 0x${reason.toString(16)}`;
 }
 
+/**
+ * Error thrown when a Wisp stream or session closes with a non-voluntary reason code.
+ *
+ * @example
+ * ```ts
+ * if (err instanceof WispCloseError && err.reason === CLOSE_REASON.AUTH_REQUIRED) {
+ *   // prompt for token
+ * }
+ * ```
+ */
 export class WispCloseError extends Error {
   readonly reason: number;
 

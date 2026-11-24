@@ -1,7 +1,14 @@
+# Build from repo root:
+#   docker build -f deploy/Dockerfile.relay -t wisp-wt-relay .
+#
+# Required runtime env vars (or CLI flags):
+#   WISP_CERT=/path/to/fullchain.pem
+#   WISP_KEY=/path/to/privkey.pem
+#   WISP_ALLOW_ORIGINS=https://app.example.com
 FROM rust:1.91-bookworm AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
-COPY src ./src
+COPY relay/Cargo.toml relay/Cargo.lock* ./
+COPY relay/src ./src
 RUN cargo build --release --bin wisp-wt-relay
 
 FROM debian:bookworm-slim

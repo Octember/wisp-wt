@@ -6,7 +6,7 @@ pub mod tls;
 pub mod ws_server;
 pub mod wt_server;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use auth_proxy::AuthProxy;
 use config::RelayConfig;
 use security::SecurityPolicy;
@@ -15,9 +15,30 @@ use std::sync::Arc;
 use tls::load_or_generate_tls;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
-pub async fn run_relay(cfg: RelayConfig) -> Result<()> {
+#[derive(Clone)]
+pub struct RelayContext {
+    pub policy: SecurityPolicy,
+    pub motd: Option<String>,
+    pub auth_proxy: Option<Arc<AuthProxy>>,
+    pub disable_raw_tcp: bool,
+}
+
+async fn resolve_bind_addr(addr: &str, flag: &str) -> Result<SocketAddr> {
+    tokio::net::lookup_host(addr)
+        .await
+        .with_context(|| format!("Failed to resolve {flag} address '{addr}'"))?
+        .next()
+        .with_context(|| format!("{flag} address '{addr}' resolved to no socket addresses"))
+}
+
+pub async fn run_relay(mut cfg: RelayConfig) -> Result<()> {
+    cfg.apply_dev_preset();
+
+    let wt_bind = resolve_bind_addr(&cfg.wt_bind, "--wt-bind").await?;
+    let ws_bind = resolve_bind_addr(&cfg.ws_bind, "--ws-bind").await?;
+
     let tls = load_or_generate_tls(
         cfg.cert.as_deref(),
         cfg.key.as_deref(),
@@ -31,40 +52,46 @@ pub async fn run_relay(cfg: RelayConfig) -> Result<()> {
         "Loaded relay TLS certificate"
     );
 
-    let policy = SecurityPolicy::from_config(&cfg);
-    let auth_proxy = cfg
-        .auth_proxy_config
-        .as_deref()
-        .map(AuthProxy::from_file)
-        .transpose()?
-        .map(Arc::new);
-    let wt_fut = wt_server::run_wt_server(
-        cfg.wt_bind,
-        tls.identity,
-        policy.clone(),
-        cfg.motd.clone(),
-        auth_proxy.clone(),
-        cfg.disable_raw_tcp,
-    );
+    if cfg.dev {
+        warn!(
+            "DEV MODE ENABLED: self-signed TLS and --allow-any-origin are active; do not use in production"
+        );
+        let ws_scheme = if cfg.ws_tls { "wss" } else { "ws" };
+        info!(
+            wt_url = %format!("https://{wt_bind}/"),
+            ws_url = %format!("{ws_scheme}://{ws_bind}/"),
+            dev_http_url = ?cfg.dev_http_bind.map(|b| format!("http://{b}/cert-hash")),
+            "Dev relay endpoints ready"
+        );
+    } else if cfg.allow_origins.is_empty() && !cfg.allow_any_origin {
+        warn!(
+            "No --allow-origin configured and --allow-any-origin is false; browser connections with an Origin header will be rejected (pass --allow-origin or --dev for local development)"
+        );
+    }
+
+    let ctx = Arc::new(RelayContext {
+        policy: SecurityPolicy::from_config(&cfg),
+        motd: cfg.motd.clone(),
+        auth_proxy: cfg
+            .auth_proxy_config
+            .as_deref()
+            .map(AuthProxy::from_file)
+            .transpose()?
+            .map(Arc::new),
+        disable_raw_tcp: cfg.disable_raw_tcp,
+    });
+    let wt_fut = wt_server::run_wt_server(wt_bind, tls.identity, Arc::clone(&ctx));
     let ws_tls = if cfg.ws_tls {
         Some(tls.rustls_config)
     } else {
         None
     };
-    let ws_fut = ws_server::run_ws_server(
-        cfg.ws_bind,
-        ws_tls,
-        policy,
-        cfg.motd.clone(),
-        auth_proxy,
-        cfg.disable_raw_tcp,
-    );
+    let ws_fut = ws_server::run_ws_server(ws_bind, ws_tls, ctx);
 
     let dev_fut = async {
         match cfg.dev_http_bind {
             Some(dev_bind) => {
-                run_dev_http_server(dev_bind, cfg.wt_bind, cfg.ws_bind, tls.cert_sha256_base64)
-                    .await
+                run_dev_http_server(dev_bind, wt_bind, ws_bind, tls.cert_sha256_base64).await
             }
             None => std::future::pending().await,
         }

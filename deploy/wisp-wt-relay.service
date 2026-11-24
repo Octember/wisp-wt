@@ -9,6 +9,11 @@ User=wisp
 Group=wisp
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Store secrets and optional overrides in /etc/wisp-wt/relay.env (chmod 0600):
+#   WISP_AUTH_TOKEN=...
+#   WISP_AUTH_PROXY_CONFIG=/etc/wisp-wt/auth-proxy.json
+#   WISP_DISABLE_RAW_TCP=true
+EnvironmentFile=-/etc/wisp-wt/relay.env
 ExecStart=/usr/local/bin/wisp-wt-relay \
   --wt-bind 0.0.0.0:443 \
   --ws-bind 0.0.0.0:443 \
@@ -17,7 +22,6 @@ ExecStart=/usr/local/bin/wisp-wt-relay \
   --key /etc/letsencrypt/live/relay.example.com/privkey.pem \
   --allow-origin https://unkernel.dev \
   --allow-origin https://trynix.dev \
-  --auth-token ${WISP_AUTH_TOKEN} \
   --max-sessions-per-ip 16 \
   --max-streams-per-session 256
 Restart=always

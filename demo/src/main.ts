@@ -66,8 +66,19 @@ function base64ToBytes(b64: string): Uint8Array {
   return out;
 }
 
-const relayInfoRes = await fetch("/api/relay-info");
+let relayInfoRes: Response;
+try {
+  relayInfoRes = await fetch("/api/relay-info");
+} catch (err) {
+  const msg = "Relay not reachable — start with: bun run dev";
+  termEl.textContent = `${msg}\n`;
+  hudReason.textContent = msg;
+  throw err;
+}
 if (!relayInfoRes.ok) {
+  const msg = "Relay not reachable — start with: bun run dev";
+  termEl.textContent = `${msg}\n`;
+  hudReason.textContent = msg;
   const body = await relayInfoRes.text().catch(() => "");
   throw new Error(`Failed to fetch /api/relay-info (${relayInfoRes.status}): ${body}`);
 }
