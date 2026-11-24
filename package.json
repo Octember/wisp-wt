@@ -34,11 +34,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/noahbuiltit/wisp-wt.git"
+    "url": "git+https://github.com/Octember/wisp-wt.git"
   },
-  "homepage": "https://github.com/noahbuiltit/wisp-wt#readme",
+  "homepage": "https://github.com/Octember/wisp-wt#readme",
   "bugs": {
-    "url": "https://github.com/noahbuiltit/wisp-wt/issues"
+    "url": "https://github.com/Octember/wisp-wt/issues"
   },
   "scripts": {
     "dev": "bun scripts/dev.ts",
