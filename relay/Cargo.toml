@@ -3,6 +3,12 @@ name = "wisp-wt-relay"
 version = "0.1.0"
 edition = "2024"
 description = "Dual-stack HTTP/3 WebTransport + WebSocket Wisp relay server"
+license = "MIT"
+repository = "https://github.com/Octember/wisp-wt"
+homepage = "https://github.com/Octember/wisp-wt"
+keywords = ["wisp", "webtransport", "http3", "quic", "wasm"]
+categories = ["network-programming", "web-programming"]
+default-run = "wisp-wt-relay"
 
 [[bin]]
 name = "wisp-wt-relay"

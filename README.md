@@ -128,3 +128,25 @@ bun run build
 bun test
 npm pack --dry-run
 ```
+
+---
+
+## Publishing & Releases
+
+### Manual First Publish (npm)
+
+Before automated OIDC Trusted Publishing is configured on npm, perform the initial publish manually:
+
+```bash
+npm login && npm publish --access public
+```
+
+### Automated `v*` Tag Releases
+
+Pushing a version tag (e.g., `v0.1.0`) triggers [`.github/workflows/release.yml`](.github/workflows/release.yml):
+
+- **Verify**: Runs TypeScript (`typecheck`, `build`, `test`) and Rust (`fmt`, `clippy`, `test`) checks.
+- **GitHub Release**: Builds `wisp-wt-relay` binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin` (with `.sha256` checksums) plus the npm tarball, and attaches them to the GitHub Release.
+- **GHCR Docker Image**: Builds and pushes multi-arch (`linux/amd64`, `linux/arm64`) images to `ghcr.io/<owner>/wisp-wt-relay:<tag>` and `:latest`.
+- **npm**: Publishes `wisp-wt` with `--provenance --access public` (via OIDC Trusted Publishing or `NPM_TOKEN`).
+- **crates.io**: Publishes `wisp-wt-relay` when `CARGO_REGISTRY_TOKEN` is configured.
