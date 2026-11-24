@@ -40,13 +40,13 @@ pub struct SessionPermit {
 
 impl Drop for SessionPermit {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.limiter.lock() {
-            if let Some(count) = guard.session_counts.get_mut(&self.ip) {
-                if *count <= 1 {
-                    guard.session_counts.remove(&self.ip);
-                } else {
-                    *count -= 1;
-                }
+        if let Ok(mut guard) = self.limiter.lock()
+            && let Some(count) = guard.session_counts.get_mut(&self.ip)
+        {
+            if *count <= 1 {
+                guard.session_counts.remove(&self.ip);
+            } else {
+                *count -= 1;
             }
         }
     }
@@ -141,12 +141,12 @@ impl SecurityPolicy {
                         continue;
                     }
                     let suffix = format!(".{rest}");
-                    if scheme == o_scheme {
-                        if let Some(sub) = o_host.strip_suffix(&suffix) {
-                            if !sub.is_empty() && !sub.contains(':') {
-                                return true;
-                            }
-                        }
+                    if scheme == o_scheme
+                        && let Some(sub) = o_host.strip_suffix(&suffix)
+                        && !sub.is_empty()
+                        && !sub.contains(':')
+                    {
+                        return true;
                     }
                 }
             }
@@ -228,10 +228,11 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 pub fn extract_query_token(path_and_query: &str) -> Option<String> {
     let (_, query) = path_and_query.split_once('?')?;
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == "token" && !v.is_empty() {
-                return Some(v.to_string());
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "token"
+            && !v.is_empty()
+        {
+            return Some(v.to_string());
         }
     }
     None

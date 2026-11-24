@@ -69,11 +69,13 @@ async fn wt_tcp_concurrent_and_udp_echo() -> Result<()> {
     let wt_port = free_udp_port();
     let ws_port = free_tcp_port();
 
-    let mut cfg = RelayConfig::default();
-    cfg.wt_bind = format!("127.0.0.1:{wt_port}").parse()?;
-    cfg.ws_bind = format!("127.0.0.1:{ws_port}").parse()?;
-    cfg.allow_loopback = true;
-    cfg.allow_any_origin = true;
+    let cfg = RelayConfig {
+        wt_bind: format!("127.0.0.1:{wt_port}").parse()?,
+        ws_bind: format!("127.0.0.1:{ws_port}").parse()?,
+        allow_loopback: true,
+        allow_any_origin: true,
+        ..Default::default()
+    };
 
     let tls = load_or_generate_tls(None, None, true, &[])?;
     let hash = Sha256Digest::new(tls.cert_sha256);
@@ -228,11 +230,13 @@ async fn ssrf_blocks_loopback_when_disabled() -> Result<()> {
     let wt_port = free_udp_port();
     let ws_port = free_tcp_port();
 
-    let mut cfg = RelayConfig::default();
-    cfg.wt_bind = format!("127.0.0.1:{wt_port}").parse()?;
-    cfg.ws_bind = format!("127.0.0.1:{ws_port}").parse()?;
-    cfg.allow_loopback = false;
-    cfg.allow_any_origin = true;
+    let cfg = RelayConfig {
+        wt_bind: format!("127.0.0.1:{wt_port}").parse()?,
+        ws_bind: format!("127.0.0.1:{ws_port}").parse()?,
+        allow_loopback: false,
+        allow_any_origin: true,
+        ..Default::default()
+    };
 
     let tls = load_or_generate_tls(None, None, true, &[])?;
     let hash = Sha256Digest::new(tls.cert_sha256);
@@ -289,9 +293,11 @@ async fn ssrf_blocks_loopback_when_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn ssrf_trailing_dot_and_extended_cidrs() {
-    let mut cfg = RelayConfig::default();
-    cfg.allow_loopback = false;
-    cfg.block_hosts = vec!["blocked.example".to_string()];
+    let cfg = RelayConfig {
+        allow_loopback: false,
+        block_hosts: vec!["blocked.example".to_string()],
+        ..Default::default()
+    };
     let policy = SecurityPolicy::from_config(&cfg);
 
     assert_eq!(
@@ -327,14 +333,16 @@ async fn ssrf_trailing_dot_and_extended_cidrs() {
 async fn ws_over_260_sequential_tcp_streams_no_slot_leak() -> anyhow::Result<()> {
     let echo_tcp = spawn_tcp_echo().await?;
     let ws_port = free_tcp_port();
-    let mut cfg = RelayConfig::default();
-    cfg.wt_bind = format!("127.0.0.1:{}", free_udp_port()).parse()?;
-    cfg.ws_bind = format!("127.0.0.1:{ws_port}").parse()?;
-    cfg.allow_any_origin = true;
-    cfg.allow_loopback = true;
-    cfg.max_streams_per_session = 64;
-    cfg.streams_per_sec = 10_000.0;
-    cfg.streams_burst = 10_000.0;
+    let cfg = RelayConfig {
+        wt_bind: format!("127.0.0.1:{}", free_udp_port()).parse()?,
+        ws_bind: format!("127.0.0.1:{ws_port}").parse()?,
+        allow_any_origin: true,
+        allow_loopback: true,
+        max_streams_per_session: 64,
+        streams_per_sec: 10_000.0,
+        streams_burst: 10_000.0,
+        ..Default::default()
+    };
 
     let _relay = tokio::spawn(async move {
         let _ = wisp_wt_relay::run_relay(cfg).await;
@@ -377,10 +385,12 @@ async fn ws_over_260_sequential_tcp_streams_no_slot_leak() -> anyhow::Result<()>
 #[tokio::test]
 async fn wt_fragmented_control_frames() -> anyhow::Result<()> {
     let wt_port = free_udp_port();
-    let mut cfg = RelayConfig::default();
-    cfg.wt_bind = format!("127.0.0.1:{wt_port}").parse()?;
-    cfg.allow_any_origin = true;
-    cfg.allow_loopback = true;
+    let cfg = RelayConfig {
+        wt_bind: format!("127.0.0.1:{wt_port}").parse()?,
+        allow_any_origin: true,
+        allow_loopback: true,
+        ..Default::default()
+    };
 
     let tls = load_or_generate_tls(None, None, true, &[])?;
     let cert_hash = tls.cert_sha256;
@@ -482,11 +492,13 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
     std::fs::write(&cfg_path, serde_json::to_string(&proxy_json)?)?;
 
     let wt_port = free_udp_port();
-    let mut cfg = RelayConfig::default();
-    cfg.wt_bind = format!("127.0.0.1:{wt_port}").parse()?;
-    cfg.allow_any_origin = true;
-    cfg.allow_loopback = true;
-    cfg.disable_raw_tcp = true;
+    let cfg = RelayConfig {
+        wt_bind: format!("127.0.0.1:{wt_port}").parse()?,
+        allow_any_origin: true,
+        allow_loopback: true,
+        disable_raw_tcp: true,
+        ..Default::default()
+    };
 
     let tls = load_or_generate_tls(None, None, true, &[])?;
     let cert_hash = tls.cert_sha256;

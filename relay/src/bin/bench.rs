@@ -144,9 +144,11 @@ async fn wt_fetch(
     Ok(t0.elapsed().as_secs_f64() * 1000.0)
 }
 
+type WsStreamMap = Arc<Mutex<HashMap<u32, (usize, usize, Instant, oneshot::Sender<f64>)>>>;
+
 struct WsClient {
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    streams: Arc<Mutex<HashMap<u32, (usize, usize, Instant, oneshot::Sender<f64>)>>>,
+    streams: WsStreamMap,
     next_id: std::sync::atomic::AtomicU32,
 }
 
@@ -158,8 +160,7 @@ impl WsClient {
         let _ = stream.next().await;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
-        let streams: Arc<Mutex<HashMap<u32, (usize, usize, Instant, oneshot::Sender<f64>)>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let streams: WsStreamMap = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(async move {
             while let Some(pkt) = rx.recv().await {

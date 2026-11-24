@@ -164,17 +164,17 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
 
 pub fn extract_token_from_info(info: &InfoPayload) -> Option<String> {
     for ext in &info.extensions {
-        if ext.id == ext_id::BEARER_AUTH {
-            if let Ok(s) = std::str::from_utf8(&ext.data) {
-                return Some(s.to_string());
-            }
+        if ext.id == ext_id::BEARER_AUTH
+            && let Ok(s) = std::str::from_utf8(&ext.data)
+        {
+            return Some(s.to_string());
         }
         if ext.id == ext_id::PASSWORD_AUTH && !ext.data.is_empty() {
             let ulen = ext.data[0] as usize;
-            if 1 + ulen <= ext.data.len() {
-                if let Ok(s) = std::str::from_utf8(&ext.data[1 + ulen..]) {
-                    return Some(s.to_string());
-                }
+            if ulen < ext.data.len()
+                && let Ok(s) = std::str::from_utf8(&ext.data[1 + ulen..])
+            {
+                return Some(s.to_string());
             }
         }
     }

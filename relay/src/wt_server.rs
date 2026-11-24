@@ -594,18 +594,13 @@ async fn handle_udp_bind(
         if encode_varint(flow_id as u64, &mut prefix).is_err() {
             return;
         }
-        loop {
-            match sock_recv.recv(&mut buf).await {
-                Ok(n) => {
-                    let mut pkt = Vec::with_capacity(prefix.len() + n);
-                    pkt.extend_from_slice(&prefix);
-                    pkt.extend_from_slice(&buf[..n]);
-                    match conn_clone.send_datagram(pkt) {
-                        Ok(()) => {}
-                        Err(wtransport::error::SendDatagramError::TooLarge) => continue,
-                        Err(_) => break,
-                    }
-                }
+        while let Ok(n) = sock_recv.recv(&mut buf).await {
+            let mut pkt = Vec::with_capacity(prefix.len() + n);
+            pkt.extend_from_slice(&prefix);
+            pkt.extend_from_slice(&buf[..n]);
+            match conn_clone.send_datagram(pkt) {
+                Ok(()) => {}
+                Err(wtransport::error::SendDatagramError::TooLarge) => continue,
                 Err(_) => break,
             }
         }

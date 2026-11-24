@@ -96,6 +96,7 @@ where
     ws_cfg.max_message_size = Some(16 * 1024 * 1024);
     ws_cfg.max_frame_size = Some(16 * 1024 * 1024);
 
+    #[allow(clippy::result_large_err)]
     let ws = accept_hdr_async_with_config(
         stream,
         |req: &Request, mut resp: Response| {
@@ -124,14 +125,13 @@ where
                 http_token = token;
             }
 
-            if let Some(proto) = req.headers().get("sec-websocket-protocol") {
-                if let Ok(p) = proto.to_str() {
-                    if p.split(',').map(str::trim).any(|s| s == "wisp-v2") {
-                        is_v2 = true;
-                        if let Ok(val) = "wisp-v2".parse() {
-                            resp.headers_mut().insert("sec-websocket-protocol", val);
-                        }
-                    }
+            if let Some(proto) = req.headers().get("sec-websocket-protocol")
+                && let Ok(p) = proto.to_str()
+                && p.split(',').map(str::trim).any(|s| s == "wisp-v2")
+            {
+                is_v2 = true;
+                if let Ok(val) = "wisp-v2".parse() {
+                    resp.headers_mut().insert("sec-websocket-protocol", val);
                 }
             }
             Ok(resp)
@@ -488,22 +488,13 @@ where
                         };
                         let s2c = async move {
                             let mut buf = vec![0u8; 4096];
-                            loop {
-                                match sock_r.recv(&mut buf).await {
-                                    Ok(n) => {
-                                        if out_r
-                                            .send(encode_ws_packet(
-                                                ws_pkt::DATA,
-                                                stream_id,
-                                                &buf[..n],
-                                            ))
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
+                            while let Ok(n) = sock_r.recv(&mut buf).await {
+                                if out_r
+                                    .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
                                 }
                             }
                         };
@@ -621,19 +612,19 @@ where
                 }
             }
             ws_pkt::DATA => {
-                if let Some(entry) = streams.get(&stream_id) {
-                    if entry.tx.try_send(payload.to_vec()).is_err() {
-                        if let Some(removed) = streams.remove(&stream_id) {
-                            removed.task.abort();
-                        }
-                        let _ = out_tx
-                            .send(encode_ws_packet(
-                                ws_pkt::CLOSE,
-                                stream_id,
-                                &[close_reason::THROTTLED],
-                            ))
-                            .await;
+                if let Some(entry) = streams.get(&stream_id)
+                    && entry.tx.try_send(payload.to_vec()).is_err()
+                {
+                    if let Some(removed) = streams.remove(&stream_id) {
+                        removed.task.abort();
                     }
+                    let _ = out_tx
+                        .send(encode_ws_packet(
+                            ws_pkt::CLOSE,
+                            stream_id,
+                            &[close_reason::THROTTLED],
+                        ))
+                        .await;
                 }
             }
             ws_pkt::CLOSE => {
