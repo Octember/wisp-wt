@@ -62,6 +62,10 @@ function base64ToBytes(b64: string): Uint8Array {
 }
 
 const relayInfoRes = await fetch("/api/relay-info");
+if (!relayInfoRes.ok) {
+  const body = await relayInfoRes.text().catch(() => "");
+  throw new Error(`Failed to fetch /api/relay-info (${relayInfoRes.status}): ${body}`);
+}
 const relayInfo = (await relayInfoRes.json()) as RelayInfoResponse;
 const certHashBytes = base64ToBytes(relayInfo.sha256Base64);
 
@@ -123,7 +127,7 @@ modeSelect.addEventListener("change", () => {
 });
 
 btnCurl.addEventListener("click", () => {
-  void runShell("apk add --no-cache curl >/dev/null && curl -sI https://example.com | head -n 5");
+  void runShell("wget -S -O - http://example.com 2>&1 | head -n 10");
 });
 
 btnGit.addEventListener("click", () => {
@@ -148,5 +152,6 @@ btnClear.addEventListener("click", () => {
   setMode: (m: string) => {
     modeSelect.value = m;
     modeSelect.dispatchEvent(new Event("change"));
+    void net.client.connect().catch(() => {});
   },
 };

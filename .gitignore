@@ -1,4 +1,5 @@
 node_modules/
+dist/
 relay/target/
 demo/dist/
 .DS_Store

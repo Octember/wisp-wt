@@ -88,6 +88,14 @@ pub struct RelayConfig {
     /// Optional Message of the Day sent in Wisp v2 INFO extension 0x04
     #[arg(long, env = "WISP_MOTD")]
     pub motd: Option<String>,
+
+    /// Path to JSON config for opt-in secretless / capability-gated HTTP auth proxy
+    #[arg(long, env = "WISP_AUTH_PROXY_CONFIG")]
+    pub auth_proxy_config: Option<PathBuf>,
+
+    /// Disable raw TCP (0x01) streams when operating as an auth-proxy-only relay
+    #[arg(long, env = "WISP_DISABLE_RAW_TCP", default_value_t = false)]
+    pub disable_raw_tcp: bool,
 }
 
 impl Default for RelayConfig {
@@ -102,7 +110,7 @@ impl Default for RelayConfig {
             self_signed: true,
             cert_sans: Vec::new(),
             allow_origins: Vec::new(),
-            allow_any_origin: true,
+            allow_any_origin: false,
             auth_token: None,
             allow_loopback: false,
             block_hosts: Vec::new(),
@@ -114,6 +122,8 @@ impl Default for RelayConfig {
             sessions_per_sec: 8.0,
             sessions_burst: 16.0,
             motd: None,
+            auth_proxy_config: None,
+            disable_raw_tcp: false,
         }
     }
 }

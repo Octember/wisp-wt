@@ -84,8 +84,10 @@ async fn wt_tcp_concurrent_and_udp_echo() -> Result<()> {
         tls.identity,
         policy.clone(),
         Some("test-motd".into()),
+        None,
+        false,
     ));
-    tokio::spawn(ws_server::run_ws_server(cfg.ws_bind, None, policy, None));
+    tokio::spawn(ws_server::run_ws_server(cfg.ws_bind, None, policy, None, None, false));
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let client_cfg = ClientConfig::builder()
@@ -218,7 +220,14 @@ async fn ssrf_blocks_loopback_when_disabled() -> Result<()> {
     let tls = load_or_generate_tls(None, None, true, &[])?;
     let hash = Sha256Digest::new(tls.cert_sha256);
     let policy = SecurityPolicy::from_config(&cfg);
-    tokio::spawn(wt_server::run_wt_server(cfg.wt_bind, tls.identity, policy, None));
+    tokio::spawn(wt_server::run_wt_server(
+        cfg.wt_bind,
+        tls.identity,
+        policy,
+        None,
+        None,
+        false,
+    ));
     tokio::time::sleep(Duration::from_millis(60)).await;
 
     let client_cfg = ClientConfig::builder()
@@ -256,5 +265,291 @@ async fn ssrf_blocks_loopback_when_disabled() -> Result<()> {
     let mut resp = [0u8; 2];
     r.read_exact(&mut resp).await?;
     assert_eq!(resp[0], close_reason::BLOCKED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ssrf_trailing_dot_and_extended_cidrs() {
+    let mut cfg = RelayConfig::default();
+    cfg.allow_loopback = false;
+    cfg.block_hosts = vec!["blocked.example".to_string()];
+    let policy = SecurityPolicy::from_config(&cfg);
+
+    assert_eq!(
+        wisp_wt_relay::security::resolve_and_check_target("blocked.example.", 80, &policy).await,
+        Err(close_reason::BLOCKED)
+    );
+
+    use std::net::IpAddr;
+    use wisp_wt_relay::security::is_disallowed_ip;
+
+    for ip_str in [
+        "0.0.0.1",
+        "192.0.0.1",
+        "192.0.2.1",
+        "198.18.0.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "240.0.0.1",
+        "::1",
+        "64:ff9b::1",
+        "64:ff9b:1::1",
+        "2002::1",
+        "2001::1",
+        "fec0::1",
+        "2001:db8::1",
+    ] {
+        let ip: IpAddr = ip_str.parse().unwrap();
+        assert!(is_disallowed_ip(ip), "expected {ip_str} to be disallowed");
+    }
+}
+
+#[tokio::test]
+async fn ws_over_260_sequential_tcp_streams_no_slot_leak() -> anyhow::Result<()> {
+    let echo_tcp = spawn_tcp_echo().await?;
+    let ws_port = free_tcp_port();
+    let mut cfg = RelayConfig::default();
+    cfg.wt_bind = format!("127.0.0.1:{}", free_udp_port()).parse()?;
+    cfg.ws_bind = format!("127.0.0.1:{ws_port}").parse()?;
+    cfg.allow_any_origin = true;
+    cfg.allow_loopback = true;
+    cfg.max_streams_per_session = 64;
+    cfg.streams_per_sec = 10_000.0;
+    cfg.streams_burst = 10_000.0;
+
+    let _relay = tokio::spawn(async move {
+        let _ = wisp_wt_relay::run_relay(cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let (mut ws, _) = connect_async(format!("ws://127.0.0.1:{ws_port}/")).await?;
+    let _ = ws.next().await.unwrap()?; // initial CONTINUE
+
+    for sid in 1..=265u32 {
+        let mut creq = vec![ws_stream_type::TCP];
+        creq.extend_from_slice(&echo_tcp.port().to_le_bytes());
+        creq.extend_from_slice(b"127.0.0.1");
+        ws.send(Message::Binary(encode_ws_packet(ws_pkt::CONNECT, sid, &creq).into()))
+            .await?;
+        ws.send(Message::Binary(encode_ws_packet(ws_pkt::DATA, sid, b"hi").into()))
+            .await?;
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await?
+            .unwrap()?;
+        let Message::Binary(rb) = msg else {
+            panic!("expected binary");
+        };
+        assert_eq!(rb[0], ws_pkt::DATA, "stream {sid} failed");
+        assert_eq!(&rb[5..], b"hi");
+
+        ws.send(Message::Binary(encode_ws_packet(ws_pkt::CLOSE, sid, &[0x02]).into()))
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wt_fragmented_control_frames() -> anyhow::Result<()> {
+    let wt_port = free_udp_port();
+    let mut cfg = RelayConfig::default();
+    cfg.wt_bind = format!("127.0.0.1:{wt_port}").parse()?;
+    cfg.allow_any_origin = true;
+    cfg.allow_loopback = true;
+
+    let tls = load_or_generate_tls(None, None, true, &[])?;
+    let cert_hash = tls.cert_sha256;
+    let policy = SecurityPolicy::from_config(&cfg);
+    tokio::spawn(wt_server::run_wt_server(
+        cfg.wt_bind,
+        tls.identity,
+        policy,
+        None,
+        None,
+        false,
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let client = Endpoint::client(
+        ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([cert_hash.into()])
+            .build(),
+    )?;
+    let conn = client.connect(format!("https://127.0.0.1:{wt_port}/")).await?;
+    let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?.await?;
+
+    let info_payload = encode_info(&InfoPayload {
+        major: 2,
+        minor: 1,
+        extensions: vec![],
+    });
+    let frame = encode_control_frame(control_msg::INFO, &info_payload);
+    // Write 0x00 stream kind + fragmented INFO frame
+    ctrl_send.write_all(&[stream_kind::CONTROL]).await?;
+    for chunk in frame.chunks(2) {
+        ctrl_send.write_all(chunk).await?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut hdr = [0u8; 5];
+    ctrl_recv.read_exact(&mut hdr).await?;
+    assert_eq!(hdr[0], control_msg::INFO);
+    let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+    let mut buf = vec![0u8; len];
+    ctrl_recv.read_exact(&mut buf).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Mock upstream HTTP/1.1 server
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = upstream_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp = if req.starts_with("GET /redirect ") {
+                    "HTTP/1.1 302 Found\r\nLocation: https://evil.example/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    let has_secret = req.to_ascii_lowercase().contains("x-api-key: secret-123");
+                    let has_client_auth = req.to_ascii_lowercase().contains("authorization: client-spoof");
+                    let body = format!("secret={has_secret};spoof={has_client_auth}");
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let cfg_path = std::env::temp_dir().join(format!("wisp_auth_proxy_{}.json", std::process::id()));
+    let proxy_json = serde_json::json!({
+        "routes": [{
+            "id": "api",
+            "upstream": format!("http://{upstream_addr}"),
+            "allowed_methods": ["GET"],
+            "allowed_paths": ["/v1/*", "/redirect"],
+            "inject_headers": { "X-Api-Key": "secret-123" },
+            "strip_request_headers": ["authorization"]
+        }]
+    });
+    std::fs::write(&cfg_path, serde_json::to_string(&proxy_json)?)?;
+
+    let wt_port = free_udp_port();
+    let mut cfg = RelayConfig::default();
+    cfg.wt_bind = format!("127.0.0.1:{wt_port}").parse()?;
+    cfg.allow_any_origin = true;
+    cfg.allow_loopback = true;
+    cfg.disable_raw_tcp = true;
+
+    let tls = load_or_generate_tls(None, None, true, &[])?;
+    let cert_hash = tls.cert_sha256;
+    let policy = SecurityPolicy::from_config(&cfg);
+    let auth_proxy = std::sync::Arc::new(wisp_wt_relay::auth_proxy::AuthProxy::from_file(&cfg_path)?);
+    tokio::spawn(wt_server::run_wt_server(
+        cfg.wt_bind,
+        tls.identity,
+        policy,
+        None,
+        Some(auth_proxy),
+        true,
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 1. Raw TCP (0x01) is blocked via WT
+    let client = Endpoint::client(
+        ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([cert_hash.into()])
+            .build(),
+    )?;
+    let conn = client.connect(format!("https://127.0.0.1:{wt_port}/")).await?;
+    let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?.await?;
+    ctrl_send.write_all(&[stream_kind::CONTROL]).await?;
+    let info_payload = encode_info(&InfoPayload {
+        major: 2,
+        minor: 1,
+        extensions: vec![],
+    });
+    ctrl_send
+        .write_all(&encode_control_frame(control_msg::INFO, &info_payload))
+        .await?;
+    let mut hdr = [0u8; 5];
+    ctrl_recv.read_exact(&mut hdr).await?;
+    let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+    let mut ibuf = vec![0u8; len];
+    ctrl_recv.read_exact(&mut ibuf).await?;
+    ctrl_recv.read_exact(&mut hdr).await?;
+    let rlen = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+    let mut rbuf = vec![0u8; rlen];
+    ctrl_recv.read_exact(&mut rbuf).await?;
+
+    let (mut raw_send, mut raw_recv) = conn.open_bi().await?.await?;
+    let mut raw_req = vec![stream_kind::TCP, 0x00];
+    raw_req.extend_from_slice(&upstream_addr.port().to_le_bytes());
+    raw_req.extend_from_slice(&9u16.to_le_bytes());
+    raw_req.extend_from_slice(b"127.0.0.1");
+    raw_send.write_all(&raw_req).await?;
+    let mut st = [0u8; 2];
+    raw_recv.read_exact(&mut st).await?;
+    assert_eq!(st[0], close_reason::BLOCKED);
+
+    // 2. HTTP_PROXY (0x02) allowed path injects secret & strips client auth
+    let (mut p_send, mut p_recv) = conn.open_bi().await?.await?;
+    let mut p_req = vec![stream_kind::HTTP_PROXY, 0x00];
+    p_req.extend_from_slice(&3u16.to_le_bytes());
+    p_req.extend_from_slice(b"api");
+    p_send.write_all(&p_req).await?;
+    p_recv.read_exact(&mut st).await?;
+    assert_eq!(st[0], 0x00);
+    p_send
+        .write_all(b"GET /v1/test HTTP/1.1\r\nHost: ignored\r\nAuthorization: client-spoof\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut resp_buf = Vec::new();
+    p_recv.read_to_end(&mut resp_buf).await?;
+    let resp_str = String::from_utf8_lossy(&resp_buf);
+    assert!(resp_str.contains("secret=true;spoof=false"), "got: {resp_str}");
+
+    // 3. Disallowed path returns 403
+    let (mut d_send, mut d_recv) = conn.open_bi().await?.await?;
+    d_send.write_all(&p_req).await?;
+    d_recv.read_exact(&mut st).await?;
+    assert_eq!(st[0], 0x00);
+    d_send
+        .write_all(b"GET /admin HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut d_buf = Vec::new();
+    d_recv.read_to_end(&mut d_buf).await?;
+    assert!(String::from_utf8_lossy(&d_buf).starts_with("HTTP/1.1 403"));
+
+    // 4. 302 redirect returned raw without following
+    let (mut r_send, mut r_recv) = conn.open_bi().await?.await?;
+    r_send.write_all(&p_req).await?;
+    r_recv.read_exact(&mut st).await?;
+    assert_eq!(st[0], 0x00);
+    r_send
+        .write_all(b"GET /redirect HTTP/1.1\r\nHost: ignored\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut r_buf = Vec::new();
+    r_recv.read_to_end(&mut r_buf).await?;
+    assert!(String::from_utf8_lossy(&r_buf).starts_with("HTTP/1.1 302"));
+
+    let _ = std::fs::remove_file(&cfg_path);
     Ok(())
 }

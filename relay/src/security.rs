@@ -90,8 +90,16 @@ impl SecurityPolicy {
             allow_any_origin: cfg.allow_any_origin,
             auth_token: cfg.auth_token.clone(),
             allow_loopback: cfg.allow_loopback,
-            block_hosts: cfg.block_hosts.iter().map(|s| s.to_ascii_lowercase()).collect(),
-            allow_hosts: cfg.allow_hosts.iter().map(|s| s.to_ascii_lowercase()).collect(),
+            block_hosts: cfg
+                .block_hosts
+                .iter()
+                .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
+                .collect(),
+            allow_hosts: cfg
+                .allow_hosts
+                .iter()
+                .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
+                .collect(),
             max_sessions_per_ip: cfg.max_sessions_per_ip,
             max_streams_per_session: cfg.max_streams_per_session,
             streams_per_sec: cfg.streams_per_sec,
@@ -119,9 +127,26 @@ impl SecurityPolicy {
                 return true;
             }
             if let Some((scheme, rest)) = a.split_once("://*.") {
+                if rest.is_empty()
+                    || rest.contains(['@', '/', '?', '#', '*'])
+                    || rest.split('.').any(|l| l.is_empty())
+                {
+                    continue;
+                }
                 if let Some((o_scheme, o_host)) = origin_lower.split_once("://") {
-                    if scheme == o_scheme && o_host.ends_with(&format!(".{rest}")) {
-                        return true;
+                    if o_host.is_empty()
+                        || o_host.contains(['@', '/', '?', '#'])
+                        || o_host.split('.').any(|l| l.is_empty())
+                    {
+                        continue;
+                    }
+                    let suffix = format!(".{rest}");
+                    if scheme == o_scheme {
+                        if let Some(sub) = o_host.strip_suffix(&suffix) {
+                            if !sub.is_empty() && !sub.contains(':') {
+                                return true;
+                            }
+                        }
                     }
                 }
             }
@@ -146,6 +171,19 @@ impl SecurityPolicy {
     pub fn try_acquire_session(&self, ip: IpAddr) -> Option<SessionPermit> {
         let mut guard = self.limiter.lock().ok()?;
         let now = Instant::now();
+        if guard.session_buckets.len() > 1024 {
+            let stale_after = std::time::Duration::from_secs(300);
+            let counts = &guard.session_counts;
+            let mut stale_ips = Vec::new();
+            for (k, b) in &guard.session_buckets {
+                if !counts.contains_key(k) && now.duration_since(b.last) > stale_after {
+                    stale_ips.push(*k);
+                }
+            }
+            for k in stale_ips {
+                guard.session_buckets.remove(&k);
+            }
+        }
         let active = guard.session_counts.get(&ip).copied().unwrap_or(0);
         if active >= self.max_sessions_per_ip {
             return None;
@@ -216,7 +254,10 @@ pub async fn resolve_and_check_target(
         return Err(close_reason::INVALID_INFO);
     }
 
-    let host_lower = host.to_ascii_lowercase();
+    let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
+    if host_lower.is_empty() {
+        return Err(close_reason::INVALID_INFO);
+    }
     if policy.block_hosts.iter().any(|b| host_lower == *b || host_lower.ends_with(&format!(".{b}"))) {
         return Err(close_reason::BLOCKED);
     }
@@ -229,10 +270,14 @@ pub async fn resolve_and_check_target(
         return Err(close_reason::BLOCKED);
     }
 
-    let addrs: Vec<SocketAddr> = lookup_host((host, port))
-        .await
-        .map_err(|_| close_reason::UNREACHABLE)?
-        .collect();
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| close_reason::UNREACHABLE)?
+    .map_err(|_| close_reason::UNREACHABLE)?
+    .collect();
 
     if addrs.is_empty() {
         return Err(close_reason::UNREACHABLE);
@@ -269,7 +314,14 @@ fn is_disallowed_v4(ip: Ipv4Addr) -> bool {
         || ip.is_multicast()
         || ip.is_broadcast()
         || ip.is_unspecified()
+        || octets[0] == 0 // 0.0.0.0/8
         || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64) // CGNAT 100.64.0.0/10
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // 192.0.0.0/24
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2) // 192.0.2.0/24 (TEST-NET-1)
+        || (octets[0] == 198 && (octets[1] & 0xfe) == 18) // 198.18.0.0/15 (Benchmarking)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100) // 198.51.100.0/24 (TEST-NET-2)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113) // 203.0.113.0/24 (TEST-NET-3)
+        || (octets[0] & 0xf0) == 240 // 240.0.0.0/4 (Reserved)
 }
 
 fn is_disallowed_v6(ip: Ipv6Addr) -> bool {
@@ -279,4 +331,11 @@ fn is_disallowed_v6(ip: Ipv6Addr) -> bool {
         || ip.is_unspecified()
         || (segs[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
         || (segs[0] & 0xffc0) == 0xfe80 // Link-local fe80::/10
+        || (segs[0] & 0xffc0) == 0xfec0 // Site-local fec0::/10
+        || (segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0) // ::/96
+        || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0) // 64:ff9b::/96
+        || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001) // 64:ff9b:1::/48
+        || segs[0] == 0x2002 // 2002::/16 (6to4)
+        || (segs[0] == 0x2001 && segs[1] == 0) // 2001::/32 (Teredo)
+        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // 2001:db8::/32 (Documentation)
 }

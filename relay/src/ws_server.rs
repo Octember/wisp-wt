@@ -1,3 +1,4 @@
+use crate::auth_proxy::{AuthProxy, handle_http_proxy_io};
 use crate::protocol::{
     Extension, InfoPayload, close_reason, decode_info, encode_info, encode_ws_packet, ext_id,
     extract_token_from_info, ws_pkt, ws_stream_type,
@@ -16,19 +17,23 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::accept_hdr_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, info, warn};
 
 const INITIAL_BUFFER: u32 = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run_ws_server(
     bind: SocketAddr,
     tls_config: Option<Arc<rustls::ServerConfig>>,
     policy: SecurityPolicy,
     motd: Option<String>,
+    auth_proxy: Option<Arc<AuthProxy>>,
+    disable_raw_tcp: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind).await.context("Bind WebSocket server")?;
     let local_addr = listener.local_addr()?;
@@ -41,14 +46,19 @@ pub async fn run_ws_server(
         let policy = policy.clone();
         let motd = motd.clone();
         let acceptor = tls_acceptor.clone();
+        let auth_proxy = auth_proxy.clone();
         tokio::spawn(async move {
             let res = if let Some(acc) = acceptor {
-                match acc.accept(stream).await {
-                    Ok(tls_stream) => handle_ws_conn(tls_stream, peer, policy, motd).await,
-                    Err(e) => Err(e.into()),
+                match tokio::time::timeout(HANDSHAKE_TIMEOUT, acc.accept(stream)).await {
+                    Ok(Ok(tls_stream)) => {
+                        handle_ws_conn(tls_stream, peer, policy, motd, auth_proxy, disable_raw_tcp)
+                            .await
+                    }
+                    Ok(Err(e)) => Err(e.into()),
+                    Err(_) => Err(anyhow::anyhow!("WebSocket TLS handshake timed out")),
                 }
             } else {
-                handle_ws_conn(stream, peer, policy, motd).await
+                handle_ws_conn(stream, peer, policy, motd, auth_proxy, disable_raw_tcp).await
             };
             if let Err(err) = res {
                 debug!(?err, %peer, "WebSocket session ended");
@@ -57,60 +67,72 @@ pub async fn run_ws_server(
     }
 }
 
+async fn finish_writer(out_tx: mpsc::Sender<Vec<u8>>, writer_task: JoinHandle<()>) {
+    drop(out_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
+}
+
 async fn handle_ws_conn<S>(
     stream: S,
     peer: SocketAddr,
     policy: SecurityPolicy,
     motd: Option<String>,
+    auth_proxy: Option<Arc<AuthProxy>>,
+    disable_raw_tcp: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut is_v2 = false;
-    let mut http_authed = false;
-    let mut rejected = false;
-
-    let ws = accept_hdr_async(stream, |req: &Request, mut resp: Response| {
-        let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
-        if !policy.check_origin(origin) {
-            warn!(?origin, %peer, "Rejected WebSocket session: disallowed Origin");
-            rejected = true;
-            return Err(ErrorResponse::new(Some("Forbidden origin".into())));
-        }
-
-        let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-        let token = extract_query_token(path).or_else(|| {
-            req.headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(extract_bearer_header)
-                .map(str::to_string)
-        });
-        if token.is_some() {
-            if !policy.verify_token(token.as_deref()) {
-                rejected = true;
-                return Err(ErrorResponse::new(Some("Unauthorized".into())));
-            }
-            http_authed = true;
-        }
-
-        if let Some(proto) = req.headers().get("sec-websocket-protocol") {
-            is_v2 = true;
-            if let Ok(p) = proto.to_str() {
-                if let Some(first) = p.split(',').next().map(str::trim).filter(|s| !s.is_empty()) {
-                    if let Ok(val) = first.parse() {
-                        resp.headers_mut().insert("sec-websocket-protocol", val);
-                    }
-                }
-            }
-        }
-        Ok(resp)
-    })
-    .await?;
-
     let Some(_permit) = policy.try_acquire_session(peer.ip()) else {
         return Ok(());
     };
+
+    let mut is_v2 = false;
+    let mut http_token: Option<String> = None;
+
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_message_size = Some(16 * 1024 * 1024);
+    ws_cfg.max_frame_size = Some(16 * 1024 * 1024);
+
+    let ws = accept_hdr_async_with_config(
+        stream,
+        |req: &Request, mut resp: Response| {
+            let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
+            if !policy.check_origin(origin) {
+                warn!(?origin, %peer, "Rejected WebSocket session: disallowed Origin");
+                return Err(ErrorResponse::new(Some("Forbidden origin".into())));
+            }
+
+            let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+            let token = extract_query_token(path).or_else(|| {
+                req.headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(extract_bearer_header)
+                    .map(str::to_string)
+            });
+            if token.is_some() {
+                if !policy.verify_token(token.as_deref()) {
+                    return Err(ErrorResponse::new(Some("Unauthorized".into())));
+                }
+                http_token = token;
+            }
+
+            if let Some(proto) = req.headers().get("sec-websocket-protocol") {
+                if let Ok(p) = proto.to_str() {
+                    if p.split(',').map(str::trim).any(|s| s == "wisp-v2") {
+                        is_v2 = true;
+                        if let Ok(val) = "wisp-v2".parse() {
+                            resp.headers_mut().insert("sec-websocket-protocol", val);
+                        }
+                    }
+                }
+            }
+            Ok(resp)
+        },
+        Some(ws_cfg),
+    )
+    .await?;
 
     let (mut ws_sink, mut ws_stream) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(512);
@@ -123,11 +145,19 @@ where
         }
     });
 
+    let mut session_token = http_token.clone();
     if is_v2 {
         let mut exts = vec![Extension {
             id: ext_id::UDP,
             data: Vec::new(),
         }];
+        if let Some(ap) = &auth_proxy {
+            let p = ap.resolve_principal(session_token.as_deref(), disable_raw_tcp);
+            exts.push(Extension {
+                id: ext_id::AUTH_PROXY,
+                data: ap.advertised_extension_json(&p),
+            });
+        }
         if let Some(m) = motd {
             exts.push(Extension {
                 id: ext_id::MOTD,
@@ -141,22 +171,23 @@ where
         });
         let _ = out_tx.send(encode_ws_packet(ws_pkt::INFO, 0, &info_bytes)).await;
 
-        // Wait for client INFO.
-        let Some(Ok(Message::Binary(first))) = ws_stream.next().await else {
-            writer_task.abort();
+        // Wait for client INFO with timeout.
+        let info_msg = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws_stream.next()).await;
+        let Ok(Some(Ok(Message::Binary(first)))) = info_msg else {
+            finish_writer(out_tx, writer_task).await;
             return Ok(());
         };
         if first.len() < 5 || first[0] != ws_pkt::INFO {
             let _ = out_tx
                 .send(encode_ws_packet(ws_pkt::CLOSE, 0, &[close_reason::INVALID_INFO]))
                 .await;
-            writer_task.abort();
+            finish_writer(out_tx, writer_task).await;
             return Ok(());
         }
         let client_info = decode_info(&first[5..])?;
-        if policy.requires_auth() && !http_authed {
-            let tok = extract_token_from_info(&client_info);
-            let reason = match tok {
+        let info_tok = extract_token_from_info(&client_info);
+        if policy.requires_auth() && session_token.is_none() {
+            let reason = match info_tok {
                 None => Some(close_reason::AUTH_REQUIRED),
                 Some(ref t) if !policy.verify_token(Some(t.as_str())) => {
                     Some(close_reason::AUTH_INVALID_PASSWORD)
@@ -165,41 +196,64 @@ where
             };
             if let Some(r) = reason {
                 let _ = out_tx.send(encode_ws_packet(ws_pkt::CLOSE, 0, &[r])).await;
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                writer_task.abort();
+                finish_writer(out_tx, writer_task).await;
                 return Ok(());
             }
         }
-    } else if policy.requires_auth() && !http_authed {
+        if session_token.is_none() {
+            session_token = info_tok;
+        }
+    } else if policy.requires_auth() && session_token.is_none() {
         let _ = out_tx
             .send(encode_ws_packet(ws_pkt::CLOSE, 0, &[close_reason::AUTH_REQUIRED]))
             .await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        writer_task.abort();
+        finish_writer(out_tx, writer_task).await;
         return Ok(());
     }
+
+    let principal = auth_proxy
+        .as_ref()
+        .map(|ap| Arc::new(ap.resolve_principal(session_token.as_deref(), disable_raw_tcp)));
 
     // Send initial CONTINUE on stream 0.
     let _ = out_tx
         .send(encode_ws_packet(ws_pkt::CONTINUE, 0, &INITIAL_BUFFER.to_le_bytes()))
         .await;
 
-    enum StreamEntry {
-        Tcp {
-            tx: mpsc::Sender<Vec<u8>>,
-            task: JoinHandle<()>,
-        },
-        Udp {
-            tx: mpsc::Sender<Vec<u8>>,
-            task: JoinHandle<()>,
-        },
+    struct StreamDropGuard {
+        stream_id: u32,
+        done_tx: mpsc::Sender<u32>,
+    }
+    impl Drop for StreamDropGuard {
+        fn drop(&mut self) {
+            let _ = self.done_tx.try_send(self.stream_id);
+        }
+    }
+
+    struct StreamEntry {
+        tx: mpsc::Sender<Vec<u8>>,
+        task: JoinHandle<()>,
     }
 
     let mut streams: HashMap<u32, StreamEntry> = HashMap::new();
+    let (done_tx, mut done_rx) = mpsc::channel::<u32>(128);
     let mut stream_limiter = policy.new_stream_limiter();
 
-    while let Some(msg) = ws_stream.next().await {
-        let Ok(msg) = msg else { break };
+    loop {
+        let msg = tokio::select! {
+            done_id = done_rx.recv() => {
+                if let Some(id) = done_id {
+                    streams.remove(&id);
+                }
+                continue;
+            }
+            next_msg = ws_stream.next() => {
+                match next_msg {
+                    Some(Ok(m)) => m,
+                    _ => break,
+                }
+            }
+        };
         let Message::Binary(data) = msg else { continue };
         if data.len() < 5 {
             continue;
@@ -237,9 +291,20 @@ where
                 let out_tx_c = out_tx.clone();
                 let policy_c = policy.clone();
                 let host_owned = host.to_string();
+                let done_tx_c = done_tx.clone();
 
                 if stype == ws_stream_type::TCP {
+                    if disable_raw_tcp || principal.as_ref().is_some_and(|p| !p.allow_raw_tcp) {
+                        let _ = out_tx
+                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::BLOCKED]))
+                            .await;
+                        continue;
+                    }
                     let task = tokio::spawn(async move {
+                        let _guard = StreamDropGuard {
+                            stream_id,
+                            done_tx: done_tx_c,
+                        };
                         let addrs = match resolve_and_check_target(&host_owned, port, &policy_c).await {
                             Ok(a) => a,
                             Err(r) => {
@@ -278,11 +343,12 @@ where
                                 received += 1;
                                 if received >= INITIAL_BUFFER / 2 {
                                     received = 0;
+                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len()) as u32;
                                     let _ = out_w
                                         .send(encode_ws_packet(
                                             ws_pkt::CONTINUE,
                                             stream_id,
-                                            &INITIAL_BUFFER.to_le_bytes(),
+                                            &cap.to_le_bytes(),
                                         ))
                                         .await;
                                 }
@@ -322,9 +388,15 @@ where
                             _ = s2c => {}
                         }
                     });
-                    streams.insert(stream_id, StreamEntry::Tcp { tx: in_tx, task });
+                    if let Some(old) = streams.insert(stream_id, StreamEntry { tx: in_tx, task }) {
+                        old.task.abort();
+                    }
                 } else if stype == ws_stream_type::UDP {
                     let task = tokio::spawn(async move {
+                        let _guard = StreamDropGuard {
+                            stream_id,
+                            done_tx: done_tx_c,
+                        };
                         let addrs = match resolve_and_check_target(&host_owned, port, &policy_c).await {
                             Ok(a) => a,
                             Err(r) => {
@@ -374,22 +446,124 @@ where
                             _ = s2c => {}
                         }
                     });
-                    streams.insert(stream_id, StreamEntry::Udp { tx: in_tx, task });
+                    if let Some(old) = streams.insert(stream_id, StreamEntry { tx: in_tx, task }) {
+                        old.task.abort();
+                    }
+                } else if stype == ws_stream_type::HTTP_PROXY {
+                    let (Some(ap), Some(p)) = (auth_proxy.as_ref(), principal.as_ref()) else {
+                        let _ = out_tx
+                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[close_reason::BLOCKED]))
+                            .await;
+                        continue;
+                    };
+                    let Some(route) = ap.get_route(&host_owned, p) else {
+                        let reason = if p.allowed_routes.is_empty() && !ap.principals.is_empty() {
+                            close_reason::AUTH_REQUIRED
+                        } else {
+                            close_reason::BLOCKED
+                        };
+                        let _ = out_tx
+                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[reason]))
+                            .await;
+                        continue;
+                    };
+                    let ap_c = Arc::clone(ap);
+                    let task = tokio::spawn(async move {
+                        let _guard = StreamDropGuard {
+                            stream_id,
+                            done_tx: done_tx_c,
+                        };
+                        let (client_io, relay_io) = tokio::io::duplex(64 * 1024);
+                        let (mut rh_read, mut rh_write) = tokio::io::split(relay_io);
+                        let out_w = out_tx_c.clone();
+                        let c2s = async move {
+                            let mut received: u32 = 0;
+                            while let Some(chunk) = in_rx.recv().await {
+                                if rh_write.write_all(&chunk).await.is_err() {
+                                    break;
+                                }
+                                received += 1;
+                                if received >= INITIAL_BUFFER / 2 {
+                                    received = 0;
+                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len()) as u32;
+                                    let _ = out_w
+                                        .send(encode_ws_packet(
+                                            ws_pkt::CONTINUE,
+                                            stream_id,
+                                            &cap.to_le_bytes(),
+                                        ))
+                                        .await;
+                                }
+                            }
+                            let _ = rh_write.shutdown().await;
+                        };
+                        let out_r = out_tx_c.clone();
+                        let s2c = async move {
+                            let mut buf = vec![0u8; 32 * 1024];
+                            loop {
+                                match rh_read.read(&mut buf).await {
+                                    Ok(0) => {
+                                        let _ = out_r
+                                            .send(encode_ws_packet(
+                                                ws_pkt::CLOSE,
+                                                stream_id,
+                                                &[close_reason::VOLUNTARY],
+                                            ))
+                                            .await;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        if out_r
+                                            .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let _ = out_r
+                                            .send(encode_ws_packet(
+                                                ws_pkt::CLOSE,
+                                                stream_id,
+                                                &[close_reason::NETWORK_ERROR],
+                                            ))
+                                            .await;
+                                        break;
+                                    }
+                                }
+                            }
+                        };
+                        let proxy_fut = handle_http_proxy_io(client_io, route, ap_c, policy_c);
+                        tokio::select! {
+                            _ = proxy_fut => {}
+                            _ = async { tokio::join!(c2s, s2c) } => {}
+                        }
+                    });
+                    if let Some(old) = streams.insert(stream_id, StreamEntry { tx: in_tx, task }) {
+                        old.task.abort();
+                    }
                 }
             }
             ws_pkt::DATA => {
                 if let Some(entry) = streams.get(&stream_id) {
-                    let tx = match entry {
-                        StreamEntry::Tcp { tx, .. } | StreamEntry::Udp { tx, .. } => tx,
-                    };
-                    let _ = tx.try_send(payload.to_vec());
+                    if entry.tx.try_send(payload.to_vec()).is_err() {
+                        if let Some(removed) = streams.remove(&stream_id) {
+                            removed.task.abort();
+                        }
+                        let _ = out_tx
+                            .send(encode_ws_packet(
+                                ws_pkt::CLOSE,
+                                stream_id,
+                                &[close_reason::THROTTLED],
+                            ))
+                            .await;
+                    }
                 }
             }
             ws_pkt::CLOSE => {
                 if let Some(entry) = streams.remove(&stream_id) {
-                    match entry {
-                        StreamEntry::Tcp { task, .. } | StreamEntry::Udp { task, .. } => task.abort(),
-                    }
+                    entry.task.abort();
                 }
             }
             _ => {}
@@ -397,10 +571,8 @@ where
     }
 
     for (_, entry) in streams.drain() {
-        match entry {
-            StreamEntry::Tcp { task, .. } | StreamEntry::Udp { task, .. } => task.abort(),
-        }
+        entry.task.abort();
     }
-    writer_task.abort();
+    finish_writer(out_tx, writer_task).await;
     Ok(())
 }

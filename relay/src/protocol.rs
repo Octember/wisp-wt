@@ -4,6 +4,7 @@ use bytes::{BufMut, BytesMut};
 pub mod stream_kind {
     pub const CONTROL: u8 = 0x00;
     pub const TCP: u8 = 0x01;
+    pub const HTTP_PROXY: u8 = 0x02;
 }
 
 pub mod control_msg {
@@ -26,6 +27,7 @@ pub mod ws_pkt {
 pub mod ws_stream_type {
     pub const TCP: u8 = 0x01;
     pub const UDP: u8 = 0x02;
+    pub const HTTP_PROXY: u8 = 0x03;
 }
 
 pub mod ext_id {
@@ -35,6 +37,7 @@ pub mod ext_id {
     pub const MOTD: u8 = 0x04;
     pub const STREAM_OPEN_CONFIRM: u8 = 0x05;
     pub const BEARER_AUTH: u8 = 0x10;
+    pub const AUTH_PROXY: u8 = 0x11;
 }
 
 pub mod close_reason {

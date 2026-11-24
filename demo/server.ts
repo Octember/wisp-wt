@@ -72,6 +72,15 @@ const server = Bun.serve({
         if (m) {
           const start = Number(m[1]);
           const end = m[2] ? Math.min(Number(m[2]), size - 1) : size - 1;
+          if (start >= size || start > end) {
+            return new Response(null, {
+              status: 416,
+              headers: {
+                "Content-Range": `bytes */${size}`,
+                ...COOP_COEP_HEADERS,
+              },
+            });
+          }
           return new Response(file.slice(start, end + 1), {
             status: 206,
             headers: {

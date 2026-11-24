@@ -6,6 +6,7 @@ import {
   WS_STREAM_TYPE,
   WispCloseError,
   type WispExtension,
+  decodeAuthProxyRoutes,
   decodeInfo,
   encodeInfo,
   encodeWsConnectPayload,
@@ -14,6 +15,7 @@ import {
   utf8Encode,
 } from "./protocol.ts";
 import type {
+  AuthProxyRoute,
   WebSocketConstructor,
   WebSocketLike,
   WispClientOptions,
@@ -35,6 +37,7 @@ interface WsStreamState {
   scheduled: boolean;
   open: boolean;
   onData: (data: Uint8Array) => void;
+  onEnd?: () => void;
   onDrain?: () => void;
   onClose: (err: Error | null) => void;
   pump: () => void;
@@ -44,6 +47,7 @@ export class WispWebSocketSession implements WispSession {
   readonly kind = "websocket" as const;
   motd: string | null = null;
   readonly maxDatagramSize: number | null = 1200;
+  authProxyRoutes: AuthProxyRoute[] = [];
   activeTcpStreams = 0;
   activeUdpFlows = 0;
   bytesTx = 0;
@@ -56,10 +60,16 @@ export class WispWebSocketSession implements WispSession {
   private readonly streams = new Map<number, WsStreamState>();
   private readonly closeListeners: Array<(err: Error | null) => void> = [];
 
-  private constructor(ws: WebSocketLike, initialCredit: number, motd: string | null) {
+  private constructor(
+    ws: WebSocketLike,
+    initialCredit: number,
+    motd: string | null,
+    authProxyRoutes: AuthProxyRoute[],
+  ) {
     this.ws = ws;
     this.initialCredit = initialCredit;
     this.motd = motd;
+    this.authProxyRoutes = authProxyRoutes;
     this.ws.onmessage = (e) => {
       const m = toUint8Array(e.data);
       this.bytesRx += m.length;
@@ -85,6 +95,7 @@ export class WispWebSocketSession implements WispSession {
     return new Promise<WispWebSocketSession>((resolve, reject) => {
       let settled = false;
       let motd: string | null = null;
+      let authProxyRoutes: AuthProxyRoute[] = [];
       const useV2 = (opts.wispVersion ?? 2) === 2;
       const ws = useV2 ? new WS(url, ["wisp-v2"]) : new WS(url);
       ws.binaryType = "arraybuffer";
@@ -114,6 +125,7 @@ export class WispWebSocketSession implements WispSession {
                 motd = utf8Decode(ext.data);
               }
             }
+            authProxyRoutes = decodeAuthProxyRoutes(info.extensions);
             const exts: WispExtension[] = [{ id: EXT_ID.UDP, data: new Uint8Array(0) }];
             if (opts.authToken) {
               exts.push({ id: EXT_ID.BEARER_AUTH, data: utf8Encode(opts.authToken) });
@@ -129,7 +141,7 @@ export class WispWebSocketSession implements WispSession {
         if (type === WS_PKT.CONTINUE && m.length >= 9) {
           settled = true;
           const credit = new DataView(m.buffer, m.byteOffset, m.byteLength).getUint32(5, true);
-          resolve(new WispWebSocketSession(ws, credit, motd));
+          resolve(new WispWebSocketSession(ws, credit, motd, authProxyRoutes));
           return;
         }
         if (type === WS_PKT.CLOSE) {
@@ -160,16 +172,29 @@ export class WispWebSocketSession implements WispSession {
       case WS_PKT.CLOSE: {
         const reason =
           m.length > 5 ? (m[5] ?? WISP_CLOSE_REASON.UNSPECIFIED) : WISP_CLOSE_REASON.UNSPECIFIED;
-        this.closeStream(
-          id,
-          reason === WISP_CLOSE_REASON.VOLUNTARY ? null : new WispCloseError(reason),
-        );
+        if (reason === WISP_CLOSE_REASON.VOLUNTARY) {
+          st.onEnd?.();
+          this.closeStream(id, null);
+        } else {
+          this.closeStream(id, new WispCloseError(reason));
+        }
         break;
       }
     }
   }
 
-  private closeStream(id: number, err: Error | null): void {
+  private trySend(pkt: Uint8Array): boolean {
+    if (this.closed || this.ws.readyState !== 1) return false;
+    try {
+      this.ws.send(pkt);
+      this.bytesTx += pkt.length;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private closeStream(id: number, err: Error | null, silent = false): void {
     const st = this.streams.get(id);
     if (!st || st.done) return;
     st.done = true;
@@ -179,10 +204,25 @@ export class WispWebSocketSession implements WispSession {
     } else {
       this.activeTcpStreams = Math.max(0, this.activeTcpStreams - 1);
     }
-    st.onClose(err);
+    if (!silent) {
+      st.onClose(err);
+    }
   }
 
   openTcpStream(host: string, port: number, events: WispTcpStreamEvents): WispTcpStream {
+    return this.openWsStream(WS_STREAM_TYPE.TCP, host, port, events);
+  }
+
+  openHttpProxy(routeId: string, events: WispTcpStreamEvents): WispTcpStream {
+    return this.openWsStream(WS_STREAM_TYPE.HTTP_PROXY, routeId, 0, events);
+  }
+
+  private openWsStream(
+    streamType: number,
+    host: string,
+    port: number,
+    events: WispTcpStreamEvents,
+  ): WispTcpStream {
     const id = this.nextId++;
     this.activeTcpStreams++;
 
@@ -195,6 +235,7 @@ export class WispWebSocketSession implements WispSession {
       scheduled: false,
       open: true,
       onData: (d) => events.onData(d),
+      onEnd: () => events.onEnd(),
       onDrain: () => events.onDrain(),
       onClose: (err) => events.onClose(err),
       pump: () => {
@@ -219,8 +260,7 @@ export class WispWebSocketSession implements WispSession {
             pkt.set(chunk, off);
             off += chunk.length;
           }
-          this.ws.send(pkt);
-          this.bytesTx += pkt.length;
+          if (!this.trySend(pkt)) break;
           st.credit--;
           st.outBytes -= n;
         }
@@ -234,10 +274,9 @@ export class WispWebSocketSession implements WispSession {
     const connectPkt = encodeWsPacket(
       WS_PKT.CONNECT,
       id,
-      encodeWsConnectPayload(WS_STREAM_TYPE.TCP, host, port),
+      encodeWsConnectPayload(streamType, host, port),
     );
-    this.ws.send(connectPkt);
-    this.bytesTx += connectPkt.length;
+    this.trySend(connectPkt);
     queueMicrotask(() => {
       if (!st.done) events.onConnect();
     });
@@ -245,7 +284,13 @@ export class WispWebSocketSession implements WispSession {
     return {
       write(data: Uint8Array) {
         if (st.done) return;
-        st.out.push(data.slice());
+        if (data.length <= MAX_PACKET) {
+          st.out.push(data.slice());
+        } else {
+          for (let off = 0; off < data.length; off += MAX_PACKET) {
+            st.out.push(data.slice(off, Math.min(off + MAX_PACKET, data.length)));
+          }
+        }
         st.outBytes += data.length;
         if (!st.scheduled) {
           st.scheduled = true;
@@ -257,11 +302,10 @@ export class WispWebSocketSession implements WispSession {
       },
       destroy: () => {
         if (st.done) return;
-        this.closeStream(id, null);
+        this.closeStream(id, null, true);
         if (!this.closed) {
           const pkt = encodeWsPacket(WS_PKT.CLOSE, id, Uint8Array.of(WISP_CLOSE_REASON.VOLUNTARY));
-          this.ws.send(pkt);
-          this.bytesTx += pkt.length;
+          this.trySend(pkt);
         }
       },
       pause() {},
@@ -295,8 +339,7 @@ export class WispWebSocketSession implements WispSession {
       id,
       encodeWsConnectPayload(WS_STREAM_TYPE.UDP, host, port),
     );
-    this.ws.send(connectPkt);
-    this.bytesTx += connectPkt.length;
+    this.trySend(connectPkt);
     queueMicrotask(() => {
       if (!st.done) events.onOpen?.();
     });
@@ -306,16 +349,14 @@ export class WispWebSocketSession implements WispSession {
       send: (data: Uint8Array) => {
         if (st.done || this.closed) return;
         const pkt = encodeWsPacket(WS_PKT.DATA, id, data);
-        this.ws.send(pkt);
-        this.bytesTx += pkt.length;
+        this.trySend(pkt);
       },
       close: () => {
         if (st.done) return;
         this.closeStream(id, null);
         if (!this.closed) {
           const pkt = encodeWsPacket(WS_PKT.CLOSE, id, Uint8Array.of(WISP_CLOSE_REASON.VOLUNTARY));
-          this.ws.send(pkt);
-          this.bytesTx += pkt.length;
+          this.trySend(pkt);
         }
       },
     };

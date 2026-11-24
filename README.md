@@ -37,3 +37,21 @@ const net = wispWtBackend({
 
 const vm = await createKernel({ net });
 ```
+
+## Secretless Auth Proxy
+
+`wisp-wt` supports Secretless Auth Proxy routes advertised by `wisp-wt-relay` via `EXT_ID.AUTH_PROXY` (`0x11`) in `INFO` extensions. Credentials stay on the relay host and never enter guest memory:
+
+- `wispWtBackend` automatically maps advertised `virtualHost`s (e.g. `github.wisp.internal`) via synthetic DNS (`198.18.0.0/15`) and routes `connect()` through `openHttpProxy(routeId, events)`.
+- Inside the guest VM, `curl http://github.wisp.internal/user` works transparently with zero secrets in guest RAM.
+- Directly on `WispClient` or `WispSession`, call `client.openHttpProxy(routeId, events)` or inspect `client.stats().authProxyRoutes`.
+
+## Packaging & Build
+
+```bash
+bun install
+bun run typecheck
+bun run build
+bun test
+npm pack --dry-run
+```

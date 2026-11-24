@@ -4,13 +4,47 @@
   "description": "WebTransport (HTTP/3) transport binding for Wisp with automatic WebSocket fallback, dual-stack Rust relay, and unkernel NetBackend adapter.",
   "license": "MIT",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./unkernel": "./src/unkernel.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./unkernel": {
+      "types": "./dist/unkernel.d.ts",
+      "default": "./dist/unkernel.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "SPEC.md"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "wisp",
+    "webtransport",
+    "http3",
+    "quic",
+    "websocket",
+    "unkernel",
+    "proxy"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/noahbuiltit/wisp-wt.git"
+  },
+  "homepage": "https://github.com/noahbuiltit/wisp-wt#readme",
+  "bugs": {
+    "url": "https://github.com/noahbuiltit/wisp-wt/issues"
   },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run build",
     "demo": "bun demo/server.ts",
     "verify:unkernel": "bun scripts/verify-unkernel.ts"
   },
@@ -18,10 +52,5 @@
     "@types/bun": "^1",
     "typescript": "^5.8.0",
     "unkernel": "^0.2.0-261124-c08e977"
-  },
-  "peerDependenciesMeta": {
-    "unkernel": {
-      "optional": true
-    }
   }
 }

@@ -28,6 +28,7 @@ export class WispClient {
   private fallbackReason: string | null = null;
   private handshakeMs: number | null = null;
   private udpBlockedUntil = 0;
+  private generation = 0;
 
   constructor(opts: WispClientOptions) {
     this.opts = opts;
@@ -58,6 +59,7 @@ export class WispClient {
       bytesRx: this.session?.bytesRx ?? 0,
       motd: this.session?.motd ?? null,
       maxDatagramSize: this.session?.maxDatagramSize ?? null,
+      authProxyRoutes: this.session?.authProxyRoutes ?? [],
     };
   }
 
@@ -69,11 +71,16 @@ export class WispClient {
     if (this.session) return this.session;
     if (this.connectPromise) return this.connectPromise;
 
+    const gen = this.generation;
     this.status = "connecting";
     this.emitState();
 
     this.connectPromise = this.establishSession().then(
       (sess) => {
+        if (gen !== this.generation) {
+          sess.close();
+          throw new Error("WispClient closed during connect");
+        }
         this.session = sess;
         this.status = "connected";
         this.transport = sess.kind;
@@ -89,9 +96,11 @@ export class WispClient {
         return sess;
       },
       (err) => {
-        this.connectPromise = null;
-        this.status = "error";
-        this.emitState();
+        if (gen === this.generation) {
+          this.connectPromise = null;
+          this.status = "error";
+          this.emitState();
+        }
         throw err;
       },
     );
@@ -99,8 +108,19 @@ export class WispClient {
   }
 
   openTcpStream(host: string, port: number, events: WispTcpStreamEvents): WispTcpStream {
+    return this.openStreamWithConnect((sess) => sess.openTcpStream(host, port, events), events);
+  }
+
+  openHttpProxy(routeId: string, events: WispTcpStreamEvents): WispTcpStream {
+    return this.openStreamWithConnect((sess) => sess.openHttpProxy(routeId, events), events);
+  }
+
+  private openStreamWithConnect(
+    openOnSession: (sess: WispSession) => WispTcpStream,
+    events: WispTcpStreamEvents,
+  ): WispTcpStream {
     if (this.session) {
-      return this.session.openTcpStream(host, port, events);
+      return openOnSession(this.session);
     }
 
     let inner: WispTcpStream | null = null;
@@ -112,7 +132,7 @@ export class WispClient {
     void this.connect().then(
       (sess) => {
         if (destroyed) return;
-        inner = sess.openTcpStream(host, port, events);
+        inner = openOnSession(sess);
         if (paused) inner.pause();
         for (const chunk of pendingWrites) {
           inner.write(chunk);
@@ -206,6 +226,7 @@ export class WispClient {
   }
 
   close(): void {
+    this.generation += 1;
     const s = this.session;
     this.session = null;
     this.connectPromise = null;
@@ -316,7 +337,16 @@ export class WispClient {
           settled = true;
           clearTimeout(fallbackTimer);
           clearTimeout(overallTimer);
-          reject(wtErr);
+          if (wsErr) {
+            reject(
+              new AggregateError(
+                [wtErr, wsErr],
+                `Both WebTransport (${wtErr.message}) and WebSocket (${wsErr.message}) failed`,
+              ),
+            );
+          } else {
+            reject(wtErr);
+          }
         }
       };
 
@@ -367,16 +397,29 @@ export class WispClient {
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+function withTimeout<T extends { close?: () => void }>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(message));
+    }, ms);
     promise.then(
       (v) => {
         clearTimeout(timer);
+        if (timedOut) {
+          v.close?.();
+          return;
+        }
         resolve(v);
       },
       (e) => {
         clearTimeout(timer);
+        if (timedOut) return;
         reject(e);
       },
     );

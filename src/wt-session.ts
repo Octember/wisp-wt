@@ -6,9 +6,11 @@ import {
   WISP_CLOSE_REASON,
   WispCloseError,
   type WispExtension,
+  decodeAuthProxyRoutes,
   decodeInfo,
   decodeVarint,
   encodeControlFrame,
+  encodeHttpProxyConnectHeader,
   encodeInfo,
   encodeTcpConnectHeader,
   encodeUdpBindPayload,
@@ -19,6 +21,7 @@ import {
   varintLength,
 } from "./protocol.ts";
 import type {
+  AuthProxyRoute,
   WebTransportConstructor,
   WebTransportLike,
   WispClientOptions,
@@ -39,10 +42,13 @@ interface ActiveUdpFlow {
   closed: boolean;
 }
 
+const MAX_CONTROL_FRAME_BYTES = 65_536;
+
 export class WispWebTransportSession implements WispSession {
   readonly kind = "webtransport" as const;
   motd: string | null = null;
   maxDatagramSize: number | null = null;
+  authProxyRoutes: AuthProxyRoute[] = [];
   activeTcpStreams = 0;
   activeUdpFlows = 0;
   bytesTx = 0;
@@ -122,6 +128,7 @@ export class WispWebTransportSession implements WispSession {
         this.motd = utf8Decode(ext.data);
       }
     }
+    this.authProxyRoutes = decodeAuthProxyRoutes(info.extensions);
 
     const readyFrame = await this.readControlFrame();
     if (readyFrame.type === CONTROL_MSG.CLOSE) {
@@ -195,6 +202,9 @@ export class WispWebTransportSession implements WispSession {
     const hdr = await this.readControlBytes(5);
     const type = hdr[0] ?? 0;
     const len = new DataView(hdr.buffer, hdr.byteOffset, hdr.byteLength).getUint32(1, true);
+    if (len > MAX_CONTROL_FRAME_BYTES) {
+      throw new Error(`Control frame too large: ${len} bytes`);
+    }
     const payload = len > 0 ? await this.readControlBytes(len) : new Uint8Array(0);
     return { type, payload };
   }
@@ -259,7 +269,13 @@ export class WispWebTransportSession implements WispSession {
         const { value, done } = await reader.read();
         if (done || !value) break;
         this.bytesRx += value.length;
-        const { value: flowId, bytesRead } = decodeVarint(value);
+        let flowId: number;
+        let bytesRead: number;
+        try {
+          ({ value: flowId, bytesRead } = decodeVarint(value));
+        } catch {
+          continue;
+        }
         const flow = this.udpFlows.get(flowId);
         if (flow && !flow.closed) {
           flow.events.onMessage(value.subarray(bytesRead));
@@ -271,7 +287,18 @@ export class WispWebTransportSession implements WispSession {
   }
 
   openTcpStream(host: string, port: number, events: WispTcpStreamEvents): WispTcpStream {
+    return this.openBidiStream(encodeTcpConnectHeader(host, port, 0x01), events);
+  }
+
+  openHttpProxy(routeId: string, events: WispTcpStreamEvents): WispTcpStream {
+    return this.openBidiStream(encodeHttpProxyConnectHeader(routeId, 0x01), events);
+  }
+
+  private openBidiStream(hdr: Uint8Array, events: WispTcpStreamEvents): WispTcpStream {
     let done = false;
+    let counted = false;
+    let readEnded = false;
+    let writeEnded = false;
     let paused = false;
     let resumeWaiter: (() => void) | null = null;
     let bufferedBytes = 0;
@@ -281,16 +308,25 @@ export class WispWebTransportSession implements WispSession {
     let endRequested = false;
     let pumping = false;
 
-    const finish = (err: Error | null) => {
+    const finish = (err: Error | null, silent = false) => {
       if (done) return;
       done = true;
-      this.activeTcpStreams = Math.max(0, this.activeTcpStreams - 1);
+      if (counted) {
+        counted = false;
+        this.activeTcpStreams = Math.max(0, this.activeTcpStreams - 1);
+      }
       if (resumeWaiter) {
         const r = resumeWaiter;
         resumeWaiter = null;
         r();
       }
-      events.onClose(err);
+      if (err !== null || silent) {
+        if (writer) void writer.abort().catch(() => {});
+        if (reader) void reader.cancel().catch(() => {});
+      }
+      if (!silent) {
+        events.onClose(err);
+      }
     };
 
     const pumpWrites = async () => {
@@ -304,8 +340,12 @@ export class WispWebTransportSession implements WispSession {
           bufferedBytes = Math.max(0, bufferedBytes - chunk.length);
           events.onDrain();
         }
-        if (endRequested && !done) {
+        if (endRequested && !done && !writeEnded) {
           await writer.close();
+          writeEnded = true;
+          if (readEnded) {
+            finish(null);
+          }
         }
       } catch (err) {
         finish(err instanceof Error ? err : new Error(String(err)));
@@ -325,11 +365,11 @@ export class WispWebTransportSession implements WispSession {
           void bi.readable.cancel().catch(() => {});
           return;
         }
+        counted = true;
         this.activeTcpStreams++;
         writer = bi.writable.getWriter();
         reader = bi.readable.getReader();
 
-        const hdr = encodeTcpConnectHeader(host, port, 0x01);
         await writer.write(hdr);
         this.bytesTx += hdr.length;
 
@@ -371,8 +411,11 @@ export class WispWebTransportSession implements WispSession {
           }
           const { value, done: rDone } = await reader.read();
           if (rDone) {
+            readEnded = true;
             events.onEnd();
-            finish(null);
+            if (writeEnded) {
+              finish(null);
+            }
             break;
           }
           if (value && value.length > 0) {
@@ -400,9 +443,7 @@ export class WispWebTransportSession implements WispSession {
       },
       destroy() {
         if (done) return;
-        finish(null);
-        if (writer) void writer.abort().catch(() => {});
-        if (reader) void reader.cancel().catch(() => {});
+        finish(null, true);
       },
       pause() {
         paused = true;

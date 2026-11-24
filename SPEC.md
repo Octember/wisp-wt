@@ -156,3 +156,30 @@ After `UDP_BIND` / `UDP_BOUND` succeeds on the Control Stream, UDP packets are s
    Ship standalone `@noahbuiltit/wisp-wt` first to validate cross-browser behavior (Chrome, Firefox, Safari 26.4) and `tc netem` benchmarks, then propose an upstream `transport-webtransport.md` PR to `MercuryWorkshop/wisp-protocol` reusing Wisp v2's `INFO`, extension, and close-code registries.
 2. **How does `unkernel`'s `vm.connect()` / network driver interface expose pluggable transports?**  
    In `pithings/unkernel`, `vm.connect(port)` is for *inbound* host-to-guest `AF_VSOCK` streams. *Outbound* guest networking is cleanly pluggable via `createKernel({ net: NetBackend })` (`js/core/net.ts`), where `NetBackend` requires `connect({ host, port }, events): NetConnection`, `lookup(name): Promise<string[]>`, and `close?(): void`. `@noahbuiltit/wisp-wt/unkernel` implements `NetBackend` directly with zero changes to `unkernel`, upgrading `end()` (real TCP half-close) and `pause()`/`resume()` (real per-stream QUIC backpressure).
+
+---
+
+## 6. Secretless / Capability-Gated HTTP Auth Proxy (`0x02` / `0x03` / `0x11`)
+
+When `--auth-proxy-config <path.json>` is enabled on the `wisp-wt` relay, the relay can act as a capability-gated HTTP/1.1 reverse proxy that injects server-side credentials (such as `${ENV_VAR}` API keys) without ever exposing them to the browser client.
+
+- **Wisp v2 `INFO` Extension (`0x11` `AUTH_PROXY`)**:
+  - UTF-8 JSON payload advertising the routes permitted for the authenticated session:
+    ```json
+    {"routes":[{"id":"openai","virtualHost":"api.openai.local"}]}
+    ```
+    (`virtualHost` is omitted if not configured for the route.)
+- **WebTransport Data Stream (`stream_kind = 0x02` `HTTP_PROXY`)**:
+  - Client opens a QUIC bidirectional stream and writes:
+    `[0x02][flags: u8][route_len: u16 LE][route_id: UTF-8]`
+  - Server responds with `[status: u8][flags: u8]` (`0x00` = ok, `0x48` = `BLOCKED`, `0xc2` = `AUTH_REQUIRED`).
+  - On `0x00`, the remainder of the stream carries plain HTTP/1.1 requests and responses.
+- **WebSocket Fallback (`ws_stream_type = 0x03` `HTTP_PROXY`)**:
+  - Client sends a Wisp `CONNECT` packet with `stream_type = 0x03`, `port = 0`, and `hostname = route_id`.
+  - `DATA` packets on that stream carry plain HTTP/1.1 requests and responses.
+- **Security Invariants**:
+  - Strict HTTP/1.1 parsing (`hyper` 1.x), `CONNECT` and `Upgrade` rejected with `403`.
+  - Method and path glob/prefix allow-lists enforced per route (`403` on mismatch).
+  - Configured `strip_request_headers` and hop-by-hop headers are stripped before `inject_headers` are applied; `Host` is overwritten with the pinned upstream host.
+  - Upstream dialing is SSRF-checked via `resolve_and_check_target`; `3xx` redirects are returned raw without following.
+  - `--disable-raw-tcp` disables raw `0x01` TCP streams when operating as an auth-proxy-only relay.

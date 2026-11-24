@@ -4,6 +4,7 @@ const textDecoder = new TextDecoder();
 export const STREAM_KIND = {
   CONTROL: 0x00,
   TCP: 0x01,
+  HTTP_PROXY: 0x02,
 } as const;
 
 export const CONTROL_MSG = {
@@ -26,6 +27,7 @@ export const WS_PKT = {
 export const WS_STREAM_TYPE = {
   TCP: 0x01,
   UDP: 0x02,
+  HTTP_PROXY: 0x03,
 } as const;
 
 export const EXT_ID = {
@@ -35,6 +37,7 @@ export const EXT_ID = {
   MOTD: 0x04,
   STREAM_OPEN_CONFIRM: 0x05,
   BEARER_AUTH: 0x10,
+  AUTH_PROXY: 0x11,
 } as const;
 
 export const WISP_CLOSE_REASON = {
@@ -162,6 +165,17 @@ export function encodeTcpConnectHeader(host: string, port: number, flags = 0x01)
   return out;
 }
 
+export function encodeHttpProxyConnectHeader(routeId: string, flags = 0x01): Uint8Array {
+  const routeBytes = textEncoder.encode(routeId);
+  const out = new Uint8Array(4 + routeBytes.length);
+  const dv = new DataView(out.buffer);
+  out[0] = STREAM_KIND.HTTP_PROXY;
+  out[1] = flags;
+  dv.setUint16(2, routeBytes.length, true);
+  out.set(routeBytes, 4);
+  return out;
+}
+
 export function encodeUdpBindPayload(flowId: number, host: string, port: number): Uint8Array {
   const hostBytes = textEncoder.encode(host);
   const out = new Uint8Array(8 + hostBytes.length);
@@ -251,4 +265,32 @@ export function utf8Decode(buf: Uint8Array): string {
 
 export function utf8Encode(text: string): Uint8Array {
   return textEncoder.encode(text);
+}
+
+export function decodeAuthProxyRoutes(
+  extensions: readonly WispExtension[],
+): Array<{ id: string; virtualHost: string }> {
+  const ext = extensions.find((e) => e.id === EXT_ID.AUTH_PROXY);
+  if (!ext || ext.data.length === 0) return [];
+  try {
+    const parsed = JSON.parse(utf8Decode(ext.data)) as { routes?: unknown };
+    if (!Array.isArray(parsed?.routes)) return [];
+    const routes: Array<{ id: string; virtualHost: string }> = [];
+    for (const item of parsed.routes) {
+      if (
+        item &&
+        typeof item === "object" &&
+        typeof (item as { id?: unknown }).id === "string" &&
+        typeof (item as { virtualHost?: unknown }).virtualHost === "string"
+      ) {
+        routes.push({
+          id: (item as { id: string }).id,
+          virtualHost: (item as { virtualHost: string }).virtualHost,
+        });
+      }
+    }
+    return routes;
+  } catch {
+    return [];
+  }
 }

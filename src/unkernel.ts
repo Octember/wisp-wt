@@ -41,7 +41,10 @@ export interface WispWtBackend extends UnkernelNetBackend {
 const FAKE_BASE = ((198 << 24) | (18 << 16)) >>> 0;
 const FAKE_SIZE = 1 << 17;
 
-const isIPv4 = (s: string) => /^\d{1,3}(\.\d{1,3}){3}$/.test(s);
+const isIPv4 = (s: string): boolean => {
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) return false;
+  return s.split(".").every((p) => Number(p) <= 255);
+};
 const ip4 = (s: string) => s.split(".").reduce((a, b) => ((a << 8) | Number(b)) >>> 0, 0);
 
 /**
@@ -57,22 +60,34 @@ export function wispWtBackend(options: WispClientOptions): WispWtBackend {
   return {
     client,
     connect({ host, port }, ev): UnkernelNetConnection {
-      const resolvedHost = isIPv4(host) ? (ipToName.get(ip4(host)) ?? host) : host;
+      const resolvedHost = isIPv4(host) ? (ipToName.get(ip4(host)) ?? host) : host.toLowerCase();
+      const proxyRoute = client
+        .stats()
+        .authProxyRoutes.find((r) => r.virtualHost.toLowerCase() === resolvedHost);
+      if (proxyRoute) {
+        return client.openHttpProxy(proxyRoute.id, ev);
+      }
       return client.openTcpStream(resolvedHost, port, ev);
     },
     lookup(name: string): Promise<string[]> {
-      if (isIPv4(name)) {
-        return Promise.resolve([name]);
+      const normalized = name.trim().toLowerCase();
+      if (!normalized) {
+        return Promise.reject(Object.assign(new Error("Empty hostname"), { code: "ENOTFOUND" }));
       }
-      let ip = nameToIp.get(name);
+      if (isIPv4(normalized)) {
+        return Promise.resolve([normalized]);
+      }
+      let ip = nameToIp.get(normalized);
       if (ip === undefined) {
-        ip = (FAKE_BASE + (nextFake++ % FAKE_SIZE)) >>> 0;
+        const offset = ((nextFake - 1) % (FAKE_SIZE - 1)) + 1;
+        nextFake++;
+        ip = (FAKE_BASE + offset) >>> 0;
         const old = ipToName.get(ip);
         if (old !== undefined) {
           nameToIp.delete(old);
         }
-        nameToIp.set(name, ip);
-        ipToName.set(ip, name);
+        nameToIp.set(normalized, ip);
+        ipToName.set(ip, normalized);
       }
       return Promise.resolve([`${ip >>> 24}.${(ip >>> 16) & 255}.${(ip >>> 8) & 255}.${ip & 255}`]);
     },

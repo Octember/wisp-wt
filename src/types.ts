@@ -76,6 +76,11 @@ export interface WispUdpFlow {
   close(): void;
 }
 
+export interface AuthProxyRoute {
+  id: string;
+  virtualHost: string;
+}
+
 export interface WispSessionSnapshot {
   status: WispConnectionStatus;
   transport: WispTransportKind | null;
@@ -87,6 +92,7 @@ export interface WispSessionSnapshot {
   bytesRx: number;
   motd: string | null;
   maxDatagramSize: number | null;
+  authProxyRoutes: readonly AuthProxyRoute[];
 }
 
 export interface WispClientOptions {
@@ -109,11 +115,13 @@ export interface WispSession {
   readonly kind: WispTransportKind;
   readonly motd: string | null;
   readonly maxDatagramSize: number | null;
+  readonly authProxyRoutes: readonly AuthProxyRoute[];
   readonly activeTcpStreams: number;
   readonly activeUdpFlows: number;
   readonly bytesTx: number;
   readonly bytesRx: number;
   openTcpStream(host: string, port: number, events: WispTcpStreamEvents): WispTcpStream;
+  openHttpProxy(routeId: string, events: WispTcpStreamEvents): WispTcpStream;
   openUdpFlow(host: string, port: number, events: WispUdpFlowEvents): WispUdpFlow;
   close(): void;
   onClosed(cb: (err: Error | null) => void): void;

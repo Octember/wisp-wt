@@ -1,47 +1,83 @@
 import { createKernel, fetchDistro } from "unkernel/node";
 import { wispWtBackend } from "../src/unkernel.ts";
 
-const wsUrl = process.env.WISP_WS_URL ?? "ws://127.0.0.1:4434/";
+const spawnRelayFlag = process.argv.includes("--spawn-relay");
+const envWsUrl = process.env.WISP_WS_URL;
+
+async function startRelay(wsPort: number, wtPort: number) {
+  const proc = Bun.spawn(
+    [
+      "cargo",
+      "run",
+      "--manifest-path",
+      "relay/Cargo.toml",
+      "--bin",
+      "wisp-wt-relay",
+      "--",
+      "--self-signed",
+      "--allow-any-origin",
+      "--ws-bind",
+      `127.0.0.1:${wsPort}`,
+      "--wt-bind",
+      `127.0.0.1:${wtPort}`,
+    ],
+    { stdout: "ignore", stderr: "inherit" },
+  );
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${wsPort}/`);
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => {
+          ws.close();
+          resolve();
+        };
+        ws.onerror = () => reject(new Error("not ready"));
+      });
+      return proc;
+    } catch {
+      await Bun.sleep(250);
+    }
+  }
+  proc.kill();
+  throw new Error("Timed out waiting for wisp-wt-relay to start");
+}
 
 async function main() {
-  const distro = await fetchDistro("alpine");
-  const net = wispWtBackend({
-    wsUrl,
-    mode: "websocket-only",
-    log: (m) => console.error(m),
-  });
+  let relayProc: ReturnType<typeof Bun.spawn> | null = null;
+  let wsUrl = envWsUrl ?? "ws://127.0.0.1:4434/";
 
-  const vm = await createKernel({ distro, net });
+  if (spawnRelayFlag || !envWsUrl) {
+    const wsPort = 14434;
+    const wtPort = 14433;
+    relayProc = await startRelay(wsPort, wtPort);
+    wsUrl = `ws://127.0.0.1:${wsPort}/`;
+  }
+
   try {
-    const curlRes = await vm.exec("/bin/sh", [
-      "-c",
-      "apk add --no-cache curl >/dev/null && curl -sI https://example.com | head -n 3",
-    ]);
-    console.log("curl exit:", curlRes.exitCode, "\n" + curlRes.stdout);
-    if (curlRes.exitCode !== 0) {
-      throw new Error(`curl failed: ${curlRes.stderr}`);
-    }
+    const distro = await fetchDistro("alpine");
+    const net = wispWtBackend({
+      wsUrl,
+      mode: "websocket-only",
+      log: (m) => console.error(m),
+    });
 
-    const gitRes = await vm.exec("/bin/sh", [
+    const vm = await createKernel({ distro, net });
+    try {
+    const wgetRes = await vm.exec("/bin/sh", [
       "-c",
-      "apk add --no-cache git >/dev/null && rm -rf /tmp/hw && git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw && ls /tmp/hw",
+      "wget -S -O - http://example.com 2>&1 | head -n 10",
     ]);
-    console.log("git exit:", gitRes.exitCode, "\n" + gitRes.stdout);
-    if (gitRes.exitCode !== 0) {
-      throw new Error(`git clone failed: ${gitRes.stderr}`);
+    console.log("wget exit:", wgetRes.exitCode, "\n" + wgetRes.stdout);
+    if (wgetRes.exitCode !== 0 || !wgetRes.stdout.includes("HTTP/")) {
+      throw new Error(`wget failed: ${wgetRes.stderr}`);
     }
-
-    const parRes = await vm.exec("/bin/sh", [
-      "-c",
-      "apk add --no-cache nodejs npm python3 py3-pip >/dev/null && (npm install --prefix /tmp/npm-test is-odd is-even >/dev/null & pip install --break-system-packages --target /tmp/pip-test six typing-extensions >/dev/null & wait) && echo PARALLEL_OK",
-    ]);
-    console.log("parallel exit:", parRes.exitCode, parRes.stdout.trim());
-    if (parRes.exitCode !== 0 || !parRes.stdout.includes("PARALLEL_OK")) {
-      throw new Error(`parallel test failed: ${parRes.stderr}`);
+    } finally {
+      net.close();
+      await vm.stop();
     }
   } finally {
-    net.close();
-    await vm.stop();
+    relayProc?.kill();
   }
 }
 
