@@ -1,0 +1,152 @@
+// oxlint-disable typescript/no-unsafe-type-assertion
+import { createKernel } from "unkernel/web";
+import {
+  wispWtBackend,
+  type WispSessionSnapshot,
+  type WispTransportMode,
+} from "../../src/index.ts";
+
+interface RelayInfoResponse {
+  sha256Base64: string;
+  wtPort: number;
+  wsPort: number;
+}
+
+const termEl = document.getElementById("terminal") as HTMLPreElement;
+const modeSelect = document.getElementById("mode-select") as HTMLSelectElement;
+const hudTransport = document.getElementById("hud-transport") as HTMLElement;
+const hudHandshake = document.getElementById("hud-handshake") as HTMLElement;
+const hudStreams = document.getElementById("hud-streams") as HTMLElement;
+const hudBytes = document.getElementById("hud-bytes") as HTMLElement;
+const hudReason = document.getElementById("hud-reason") as HTMLElement;
+const btnCurl = document.getElementById("btn-curl") as HTMLButtonElement;
+const btnGit = document.getElementById("btn-git") as HTMLButtonElement;
+const btnParallel = document.getElementById("btn-parallel") as HTMLButtonElement;
+const btnClear = document.getElementById("btn-clear") as HTMLButtonElement;
+
+function appendLog(text: string): void {
+  termEl.textContent += text;
+  termEl.scrollTop = termEl.scrollHeight;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
+function updateHud(snap: WispSessionSnapshot): void {
+  if (snap.transport === "webtransport") {
+    hudTransport.textContent = "HTTP/3 WebTransport";
+    hudTransport.className = "badge wt";
+  } else if (snap.transport === "websocket") {
+    hudTransport.textContent = "WebSocket Fallback";
+    hudTransport.className = "badge ws";
+  } else {
+    hudTransport.textContent = snap.status;
+    hudTransport.className = "badge";
+  }
+  hudHandshake.textContent = snap.handshakeMs !== null ? `${snap.handshakeMs} ms` : "—";
+  hudStreams.textContent = `${snap.activeTcpStreams} TCP / ${snap.activeUdpFlows} UDP`;
+  hudBytes.textContent = `${formatBytes(snap.bytesTx)} / ${formatBytes(snap.bytesRx)}`;
+  hudReason.textContent = snap.fallbackReason ?? (snap.motd ? `MOTD: ${snap.motd}` : snap.status);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+const relayInfoRes = await fetch("/api/relay-info");
+const relayInfo = (await relayInfoRes.json()) as RelayInfoResponse;
+const certHashBytes = base64ToBytes(relayInfo.sha256Base64);
+
+const wtUrl = `https://127.0.0.1:${relayInfo.wtPort}/`;
+const wsUrl = `ws://127.0.0.1:${relayInfo.wsPort}/`;
+
+const net = wispWtBackend({
+  wtUrl,
+  wsUrl,
+  mode: "auto",
+  fallbackDelayMs: 1200,
+  serverCertificateHashes: [{ algorithm: "sha-256", value: certHashBytes }],
+  log: (msg) => appendLog(`${msg}\n`),
+  onStateChange: updateHud,
+});
+
+const vm = await createKernel({
+  distro: "/alpine.img",
+  net,
+});
+
+appendLog("unkernel Alpine Linux booted!\n");
+btnCurl.disabled = false;
+btnGit.disabled = false;
+btnParallel.disabled = false;
+
+setInterval(() => updateHud(net.stats()), 250);
+
+async function runShell(
+  cmd: string,
+): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
+  appendLog(`\n$ ${cmd}\n`);
+  const res = await vm.exec("/bin/sh", ["-c", cmd]);
+  if (res.stdout) appendLog(res.stdout);
+  if (res.stderr) appendLog(res.stderr);
+  appendLog(`[exit ${String(res.exitCode)}]\n`);
+  updateHud(net.stats());
+  return { stdout: res.stdout, stderr: res.stderr, exitCode: res.exitCode };
+}
+
+modeSelect.addEventListener("change", () => {
+  const val = modeSelect.value;
+  if (val === "simulate-blocked") {
+    net.client.updateOptions({
+      wtUrl: "https://127.0.0.1:44399/",
+      wsUrl,
+      mode: "auto",
+      fallbackDelayMs: 300,
+    });
+  } else {
+    net.client.updateOptions({
+      wtUrl,
+      wsUrl,
+      mode: val as WispTransportMode,
+      fallbackDelayMs: 1200,
+    });
+  }
+  updateHud(net.stats());
+});
+
+btnCurl.addEventListener("click", () => {
+  void runShell("apk add --no-cache curl >/dev/null && curl -sI https://example.com | head -n 5");
+});
+
+btnGit.addEventListener("click", () => {
+  void runShell(
+    "apk add --no-cache git >/dev/null && rm -rf /tmp/hw && git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw && ls -la /tmp/hw",
+  );
+});
+
+btnParallel.addEventListener("click", () => {
+  void runShell(
+    "apk add --no-cache nodejs npm python3 py3-pip >/dev/null && (npm install --prefix /tmp/npm-test is-odd is-even >/dev/null & pip install --break-system-packages --target /tmp/pip-test six typing-extensions >/dev/null & wait) && echo PARALLEL_OK",
+  );
+});
+
+btnClear.addEventListener("click", () => {
+  termEl.textContent = "";
+});
+
+(window as unknown as Record<string, unknown>).wispDemo = {
+  runCommand: runShell,
+  getStats: () => net.stats(),
+  setMode: (m: string) => {
+    modeSelect.value = m;
+    modeSelect.dispatchEvent(new Event("change"));
+  },
+};

@@ -1,0 +1,51 @@
+export { WispClient } from "./client.ts";
+export {
+  CONTROL_MSG,
+  EXT_ID,
+  STREAM_KIND,
+  WISP_CLOSE_REASON,
+  WS_PKT,
+  WS_STREAM_TYPE,
+  WispCloseError,
+  type WispExtension,
+  decodeInfo,
+  decodeVarint,
+  describeCloseReason,
+  encodeControlFrame,
+  encodeInfo,
+  encodeTcpConnectHeader,
+  encodeUdpBindPayload,
+  encodeUdpClosePayload,
+  encodeVarint,
+  encodeWsConnectPayload,
+  encodeWsPacket,
+  varintLength,
+} from "./protocol.ts";
+export type {
+  WebSocketConstructor,
+  WebSocketLike,
+  WebTransportBidiStreamLike,
+  WebTransportConstructor,
+  WebTransportDatagramsLike,
+  WebTransportLike,
+  WispClientOptions,
+  WispConnectionStatus,
+  WispServerCertificateHash,
+  WispSession,
+  WispSessionSnapshot,
+  WispTcpStream,
+  WispTcpStreamEvents,
+  WispTransportKind,
+  WispTransportMode,
+  WispUdpFlow,
+  WispUdpFlowEvents,
+} from "./types.ts";
+export {
+  wispWtBackend,
+  type UnkernelNetBackend,
+  type UnkernelNetConnection,
+  type UnkernelNetConnectionEvents,
+  type WispWtBackend,
+} from "./unkernel.ts";
+export { WispWebSocketSession } from "./ws-session.ts";
+export { WispWebTransportSession } from "./wt-session.ts";

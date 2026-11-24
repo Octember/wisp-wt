@@ -1,0 +1,27 @@
+{
+  "name": "wisp-wt",
+  "version": "0.1.0",
+  "description": "WebTransport (HTTP/3) transport binding for Wisp with automatic WebSocket fallback, dual-stack Rust relay, and unkernel NetBackend adapter.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./unkernel": "./src/unkernel.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "demo": "bun demo/server.ts",
+    "verify:unkernel": "bun scripts/verify-unkernel.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1",
+    "typescript": "^5.8.0",
+    "unkernel": "^0.2.0-261124-c08e977"
+  },
+  "peerDependenciesMeta": {
+    "unkernel": {
+      "optional": true
+    }
+  }
+}

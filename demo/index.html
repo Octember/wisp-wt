@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wisp-WT · WebTransport (HTTP/3) for Browser Linux (unkernel)</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Wisp over WebTransport (HTTP/3)</h1>
+          <p class="subtitle">
+            Real Alpine Linux in WebAssembly (<code>unkernel</code>) over QUIC streams + automatic
+            WebSocket fallback
+          </p>
+        </div>
+        <div class="controls">
+          <label for="mode-select">Transport Mode</label>
+          <select id="mode-select">
+            <option value="auto">Auto (WebTransport → WS Fallback)</option>
+            <option value="webtransport-only">WebTransport Only (HTTP/3)</option>
+            <option value="websocket-only">WebSocket Only (Wisp v2)</option>
+            <option value="simulate-blocked">Simulate UDP/443 Blocked</option>
+          </select>
+        </div>
+      </header>
+
+      <section class="hud" id="hud">
+        <div class="card">
+          <span class="label">Active Transport</span>
+          <strong id="hud-transport" class="badge">booting...</strong>
+        </div>
+        <div class="card">
+          <span class="label">Handshake</span>
+          <strong id="hud-handshake">—</strong>
+        </div>
+        <div class="card">
+          <span class="label">Active Streams</span>
+          <strong id="hud-streams">0</strong>
+        </div>
+        <div class="card">
+          <span class="label">TX / RX</span>
+          <strong id="hud-bytes">0 B / 0 B</strong>
+        </div>
+        <div class="card wide">
+          <span class="label">Status / Fallback Reason</span>
+          <strong id="hud-reason">initializing...</strong>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="btn-curl" disabled>Run curl test</button>
+        <button id="btn-git" disabled>Run git clone test</button>
+        <button id="btn-parallel" disabled>Run parallel apk/npm/pip test</button>
+        <button id="btn-clear">Clear Output</button>
+      </section>
+
+      <pre id="terminal" class="terminal">Booting unkernel Alpine Linux...\n</pre>
+    </main>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

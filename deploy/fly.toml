@@ -1,0 +1,22 @@
+# Fly.io deployment for wisp-wt-relay with real UDP/443 (WebTransport) + TCP/443 (WSS fallback)
+# Note: On Fly.io, UDP services must bind to `fly-global-services` (set --wt-bind fly-global-services:443).
+app = "wisp-wt-relay"
+primary_region = "sea"
+
+[build]
+dockerfile = "Dockerfile.relay"
+
+[env]
+RUST_LOG = "info"
+
+[[services]]
+protocol = "udp"
+internal_port = 443
+[[services.ports]]
+port = 443
+
+[[services]]
+protocol = "tcp"
+internal_port = 443
+[[services.ports]]
+port = 443
