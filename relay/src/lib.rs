@@ -60,19 +60,19 @@ pub async fn run_relay(cfg: RelayConfig) -> Result<()> {
         cfg.disable_raw_tcp,
     );
 
-    if let Some(dev_bind) = cfg.dev_http_bind {
-        let dev_fut =
-            run_dev_http_server(dev_bind, cfg.wt_bind, cfg.ws_bind, tls.cert_sha256_base64);
-        tokio::select! {
-            r = wt_fut => r?,
-            r = ws_fut => r?,
-            r = dev_fut => r?,
+    let dev_fut = async {
+        match cfg.dev_http_bind {
+            Some(dev_bind) => {
+                run_dev_http_server(dev_bind, cfg.wt_bind, cfg.ws_bind, tls.cert_sha256_base64)
+                    .await
+            }
+            None => std::future::pending().await,
         }
-    } else {
-        tokio::select! {
-            r = wt_fut => r?,
-            r = ws_fut => r?,
-        }
+    };
+    tokio::select! {
+        r = wt_fut => r?,
+        r = ws_fut => r?,
+        r = dev_fut => r?,
     }
     Ok(())
 }
@@ -92,10 +92,17 @@ async fn run_dev_http_server(
         "wsPort": ws_bind.port(),
     })
     .to_string();
+    let ok_resp: Arc<[u8]> = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes()
+    .into();
 
     loop {
         let (mut sock, _) = listener.accept().await?;
-        let body = body.clone();
+        let ok_resp = Arc::clone(&ok_resp);
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let n =
@@ -109,17 +116,12 @@ async fn run_dev_http_server(
             let first_line = req.lines().next().unwrap_or("");
             let is_cert_hash = first_line.starts_with("GET /cert-hash ")
                 || first_line.starts_with("GET /cert-hash?");
-            let resp = if is_cert_hash {
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
+            let resp: &[u8] = if is_cert_hash {
+                &ok_resp
             } else {
-                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_string()
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             };
-            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.write_all(resp).await;
         });
     }
 }

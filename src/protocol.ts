@@ -1,3 +1,5 @@
+import type { AuthProxyRoute } from "./types.ts";
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
@@ -269,28 +271,49 @@ export function utf8Encode(text: string): Uint8Array {
 
 export function decodeAuthProxyRoutes(
   extensions: readonly WispExtension[],
-): Array<{ id: string; virtualHost: string }> {
+): AuthProxyRoute[] {
   const ext = extensions.find((e) => e.id === EXT_ID.AUTH_PROXY);
   if (!ext || ext.data.length === 0) return [];
   try {
     const parsed = JSON.parse(utf8Decode(ext.data)) as { routes?: unknown };
     if (!Array.isArray(parsed?.routes)) return [];
-    const routes: Array<{ id: string; virtualHost: string }> = [];
+    const routes: AuthProxyRoute[] = [];
     for (const item of parsed.routes) {
-      if (
-        item &&
-        typeof item === "object" &&
-        typeof (item as { id?: unknown }).id === "string" &&
-        typeof (item as { virtualHost?: unknown }).virtualHost === "string"
-      ) {
-        routes.push({
-          id: (item as { id: string }).id,
-          virtualHost: (item as { virtualHost: string }).virtualHost,
-        });
+      if (!item || typeof item !== "object") continue;
+      const { id, virtualHost } = item as { id?: unknown; virtualHost?: unknown };
+      if (typeof id !== "string") continue;
+      if (virtualHost === undefined) {
+        routes.push({ id });
+      } else if (typeof virtualHost === "string") {
+        routes.push({ id, virtualHost });
       }
     }
     return routes;
   } catch {
     return [];
   }
+}
+
+export function toError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+export function dataView(buf: Uint8Array): DataView {
+  return new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+
+export function parseServerInfo(extensions: readonly WispExtension[]): {
+  motd: string | null;
+  authProxyRoutes: AuthProxyRoute[];
+} {
+  const motdExt = extensions.find((e) => e.id === EXT_ID.MOTD);
+  return {
+    motd: motdExt ? utf8Decode(motdExt.data) : null,
+    authProxyRoutes: decodeAuthProxyRoutes(extensions),
+  };
+}
+
+export function getGlobalCtor<T>(name: string): T | undefined {
+  const ctor = Reflect.get(globalThis, name);
+  return typeof ctor === "function" ? (ctor as T) : undefined;
 }

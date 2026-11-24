@@ -87,6 +87,9 @@ async fn run_origin_server(addr: SocketAddr) -> Result<()> {
 }
 
 fn parse_hex_32(hex: &str) -> Result<[u8; 32]> {
+    if hex.len() != 64 || !hex.is_ascii() {
+        anyhow::bail!("Expected 32-byte hex digest");
+    }
     let bytes = (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))

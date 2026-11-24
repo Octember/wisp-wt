@@ -57,16 +57,17 @@ pub struct AuthProxyFileConfig {
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
     pub id: String,
-    pub scheme: String,
+    pub use_tls: bool,
     pub host: String,
     pub port: u16,
-    pub host_header: String,
+    pub host_header: HeaderValue,
     pub base_path: String,
-    pub allowed_methods: Vec<String>,
+    pub allowed_methods: Vec<Method>,
     pub allowed_paths: Vec<String>,
     pub inject_headers: Vec<(HeaderName, HeaderValue)>,
-    pub strip_request_headers: Vec<String>,
-    pub strip_response_headers: Vec<String>,
+    pub strip_request_headers: Vec<HeaderName>,
+    pub strip_response_headers: Vec<HeaderName>,
+    pub tls_server_name: Option<rustls::pki_types::ServerName<'static>>,
     pub virtual_host: Option<String>,
 }
 
@@ -182,6 +183,20 @@ impl AuthProxy {
         }
         self.routes.get(route_id).cloned()
     }
+
+    pub fn authorize_route(
+        proxy: Option<&Arc<AuthProxy>>,
+        principal: Option<&SessionPrincipal>,
+        route_id: &str,
+    ) -> std::result::Result<(Arc<AuthProxy>, Arc<CompiledRoute>), u8> {
+        let (Some(ap), Some(p)) = (proxy, principal) else {
+            return Err(crate::protocol::close_reason::BLOCKED);
+        };
+        let Some(route) = ap.get_route(route_id, p) else {
+            return Err(crate::protocol::close_reason::BLOCKED);
+        };
+        Ok((Arc::clone(ap), route))
+    }
 }
 
 fn compile_route(r: AuthProxyRouteConfig) -> Result<CompiledRoute> {
@@ -193,18 +208,58 @@ fn compile_route(r: AuthProxyRouteConfig) -> Result<CompiledRoute> {
         .scheme_str()
         .map(|s| s.to_ascii_lowercase())
         .context("Upstream URI missing scheme")?;
-    if scheme != "http" && scheme != "https" {
-        bail!("Unsupported upstream scheme '{scheme}' for route {}", r.id);
-    }
+    let use_tls = match scheme.as_str() {
+        "http" => false,
+        "https" => true,
+        _ => bail!("Unsupported upstream scheme '{scheme}' for route {}", r.id),
+    };
     let host = uri.host().context("Upstream URI missing host")?.to_string();
-    let default_port = if scheme == "https" { 443 } else { 80 };
+    let default_port = if use_tls { 443 } else { 80 };
     let port = uri.port_u16().unwrap_or(default_port);
-    let host_header = if uri.port_u16().is_some() {
+    let host_header_str = if uri.port_u16().is_some() {
         format!("{host}:{port}")
     } else {
         host.clone()
     };
+    let host_header = HeaderValue::from_str(&host_header_str)
+        .with_context(|| format!("Invalid host header '{host_header_str}' for route {}", r.id))?;
     let base_path = uri.path().trim_end_matches('/').to_string();
+
+    let tls_server_name = if use_tls {
+        Some(
+            rustls::pki_types::ServerName::try_from(host.clone())
+                .map_err(|_| anyhow::anyhow!("Invalid upstream TLS server name '{host}'"))?,
+        )
+    } else {
+        None
+    };
+
+    let allowed_methods = r
+        .allowed_methods
+        .into_iter()
+        .map(|m| {
+            Method::from_bytes(m.to_ascii_uppercase().as_bytes())
+                .with_context(|| format!("Invalid allowed method '{m}' for route {}", r.id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let strip_request_headers = r
+        .strip_request_headers
+        .into_iter()
+        .map(|h| {
+            HeaderName::from_bytes(h.as_bytes())
+                .with_context(|| format!("Invalid strip_request_headers '{h}' for route {}", r.id))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let strip_response_headers = r
+        .strip_response_headers
+        .into_iter()
+        .map(|h| {
+            HeaderName::from_bytes(h.as_bytes())
+                .with_context(|| format!("Invalid strip_response_headers '{h}' for route {}", r.id))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let mut inject_headers = Vec::new();
     for (k, v) in r.inject_headers {
@@ -218,28 +273,17 @@ fn compile_route(r: AuthProxyRouteConfig) -> Result<CompiledRoute> {
 
     Ok(CompiledRoute {
         id: r.id,
-        scheme,
+        use_tls,
         host,
         port,
         host_header,
         base_path,
-        allowed_methods: r
-            .allowed_methods
-            .into_iter()
-            .map(|m| m.to_ascii_uppercase())
-            .collect(),
+        allowed_methods,
         allowed_paths: r.allowed_paths,
         inject_headers,
-        strip_request_headers: r
-            .strip_request_headers
-            .into_iter()
-            .map(|h| h.to_ascii_lowercase())
-            .collect(),
-        strip_response_headers: r
-            .strip_response_headers
-            .into_iter()
-            .map(|h| h.to_ascii_lowercase())
-            .collect(),
+        strip_request_headers,
+        strip_response_headers,
+        tls_server_name,
         virtual_host: r.virtual_host,
     })
 }
@@ -310,29 +354,26 @@ async fn proxy_single_request(
     proxy: &AuthProxy,
     policy: &SecurityPolicy,
 ) -> Response<Full<Bytes>> {
-    let method = req.method().clone();
-    let path_and_query = req
-        .uri()
+    let (parts, body) = req.into_parts();
+    let method = parts.method;
+    let path_and_query = parts
+        .uri
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or("/")
-        .to_string();
-    let path = req.uri().path().to_string();
+        .unwrap_or("/");
+    let path = parts.uri.path();
 
-    if method == Method::CONNECT || req.headers().contains_key(hyper::header::UPGRADE) {
+    if method == Method::CONNECT || parts.headers.contains_key(hyper::header::UPGRADE) {
         warn!(route_id = %route.id, %method, %path, "auth_proxy_rejected_upgrade_or_connect");
         return simple_response(StatusCode::FORBIDDEN, "CONNECT and Upgrade are not allowed");
     }
 
-    if !route.allowed_methods.is_empty()
-        && !route.allowed_methods.iter().any(|m| m == method.as_str())
-    {
+    if !route.allowed_methods.is_empty() && !route.allowed_methods.contains(&method) {
         warn!(route_id = %route.id, %method, %path, "auth_proxy_disallowed_method");
         return simple_response(StatusCode::FORBIDDEN, "Method not allowed");
     }
 
-    if !route.allowed_paths.is_empty()
-        && !route.allowed_paths.iter().any(|p| path_matches(p, &path))
+    if !route.allowed_paths.is_empty() && !route.allowed_paths.iter().any(|p| path_matches(p, path))
     {
         warn!(route_id = %route.id, %method, %path, "auth_proxy_disallowed_path");
         return simple_response(StatusCode::FORBIDDEN, "Path not allowed");
@@ -346,28 +387,28 @@ async fn proxy_single_request(
         }
     };
 
-    let (parts, body) = req.into_parts();
     let body_bytes = match body.collect().await {
         Ok(c) => c.to_bytes(),
         Err(_) => return simple_response(StatusCode::BAD_REQUEST, "Failed to read request body"),
     };
 
-    let upstream_path = if route.base_path.is_empty() {
-        path_and_query.to_string()
+    let upstream_path: std::borrow::Cow<'_, str> = if route.base_path.is_empty() {
+        std::borrow::Cow::Borrowed(path_and_query)
     } else {
-        format!("{}{}", route.base_path, path_and_query)
+        std::borrow::Cow::Owned(format!("{}{}", route.base_path, path_and_query))
     };
 
-    let mut out_req = Request::builder()
+    let Ok(mut out_req) = Request::builder()
         .method(method.clone())
-        .uri(&upstream_path)
+        .uri(upstream_path.as_ref())
         .body(Full::new(body_bytes))
-        .unwrap();
+    else {
+        return simple_response(StatusCode::BAD_REQUEST, "Invalid request URI");
+    };
 
     for (name, val) in &parts.headers {
-        let lower = name.as_str().to_ascii_lowercase();
         if matches!(
-            lower.as_str(),
+            name.as_str(),
             "host"
                 | "connection"
                 | "proxy-connection"
@@ -379,15 +420,15 @@ async fn proxy_single_request(
         ) {
             continue;
         }
-        if route.strip_request_headers.iter().any(|h| h == &lower) {
+        if route.strip_request_headers.contains(name) {
             continue;
         }
         out_req.headers_mut().append(name.clone(), val.clone());
     }
 
-    if let Ok(host_val) = HeaderValue::from_str(&route.host_header) {
-        out_req.headers_mut().insert(hyper::header::HOST, host_val);
-    }
+    out_req
+        .headers_mut()
+        .insert(hyper::header::HOST, route.host_header.clone());
     for (name, val) in &route.inject_headers {
         out_req.headers_mut().insert(name.clone(), val.clone());
     }
@@ -398,8 +439,8 @@ async fn proxy_single_request(
     };
     let _ = tcp.set_nodelay(true);
 
-    let resp = if route.scheme == "https" {
-        let Ok(server_name) = rustls::pki_types::ServerName::try_from(route.host.clone()) else {
+    let resp = if route.use_tls {
+        let Some(server_name) = route.tls_server_name.clone() else {
             return simple_response(StatusCode::BAD_GATEWAY, "Invalid upstream TLS server name");
         };
         let tls_stream = match tokio::time::timeout(
@@ -411,19 +452,17 @@ async fn proxy_single_request(
             Ok(Ok(s)) => s,
             _ => return simple_response(StatusCode::BAD_GATEWAY, "Upstream TLS handshake failed"),
         };
-        send_http1_request(tls_stream, out_req).await
+        tokio::time::timeout(UPSTREAM_TIMEOUT, send_http1_request(tls_stream, out_req)).await
     } else {
-        send_http1_request(tcp, out_req).await
+        tokio::time::timeout(UPSTREAM_TIMEOUT, send_http1_request(tcp, out_req)).await
     };
 
     match resp {
-        Ok(mut r) => {
+        Ok(Ok(mut r)) => {
             let status = r.status();
             let headers = r.headers_mut();
             for h in &route.strip_response_headers {
-                if let Ok(name) = HeaderName::from_bytes(h.as_bytes()) {
-                    headers.remove(&name);
-                }
+                headers.remove(h);
             }
             info!(
                 route_id = %route.id,
@@ -434,7 +473,7 @@ async fn proxy_single_request(
             );
             r
         }
-        Err(_) => {
+        Ok(Err(_)) | Err(_) => {
             warn!(route_id = %route.id, %method, %path, "auth_proxy_upstream_error");
             simple_response(StatusCode::BAD_GATEWAY, "Upstream request failed")
         }

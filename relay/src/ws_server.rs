@@ -3,9 +3,7 @@ use crate::protocol::{
     Extension, InfoPayload, close_reason, decode_info, encode_info, encode_ws_packet, ext_id,
     extract_token_from_info, ws_pkt, ws_stream_type,
 };
-use crate::security::{
-    SecurityPolicy, extract_bearer_header, extract_query_token, resolve_and_check_target,
-};
+use crate::security::{SecurityPolicy, connect_tcp, connect_udp, extract_http_token};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
@@ -13,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
@@ -111,13 +109,11 @@ where
                 .path_and_query()
                 .map(|pq| pq.as_str())
                 .unwrap_or("/");
-            let token = extract_query_token(path).or_else(|| {
-                req.headers()
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(extract_bearer_header)
-                    .map(str::to_string)
-            });
+            let auth_hdr = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok());
+            let token = extract_http_token(path, auth_hdr);
             if token.is_some() {
                 if !policy.verify_token(token.as_deref()) {
                     return Err(ErrorResponse::new(Some("Unauthorized".into())));
@@ -240,29 +236,23 @@ where
         ))
         .await;
 
-    struct StreamDropGuard {
-        stream_id: u32,
-        done_tx: mpsc::Sender<u32>,
-    }
-    impl Drop for StreamDropGuard {
-        fn drop(&mut self) {
-            let _ = self.done_tx.try_send(self.stream_id);
-        }
-    }
-
     struct StreamEntry {
+        instance: u64,
         tx: mpsc::Sender<Vec<u8>>,
         task: JoinHandle<()>,
     }
 
     let mut streams: HashMap<u32, StreamEntry> = HashMap::new();
-    let (done_tx, mut done_rx) = mpsc::channel::<u32>(128);
+    let (done_tx, mut done_rx) = mpsc::channel::<(u32, u64)>(128);
+    let mut next_instance: u64 = 0;
     let mut stream_limiter = policy.new_stream_limiter();
 
     loop {
         let msg = tokio::select! {
             done_id = done_rx.recv() => {
-                if let Some(id) = done_id {
+                if let Some((id, inst)) = done_id
+                    && streams.get(&id).is_some_and(|e| e.instance == inst)
+                {
                     streams.remove(&id);
                 }
                 continue;
@@ -311,304 +301,76 @@ where
                     continue;
                 };
 
-                let (in_tx, mut in_rx) = mpsc::channel::<Vec<u8>>(INITIAL_BUFFER as usize);
-                let out_tx_c = out_tx.clone();
-                let policy_c = policy.clone();
-                let host_owned = host.to_string();
-                let done_tx_c = done_tx.clone();
+                let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(INITIAL_BUFFER as usize);
+                next_instance = next_instance.wrapping_add(1);
+                let instance = next_instance;
+                let guard = StreamDropGuard {
+                    stream_id,
+                    instance,
+                    done_tx: done_tx.clone(),
+                };
 
-                if stype == ws_stream_type::TCP {
-                    if disable_raw_tcp || principal.as_ref().is_some_and(|p| !p.allow_raw_tcp) {
-                        let _ = out_tx
-                            .send(encode_ws_packet(
-                                ws_pkt::CLOSE,
-                                stream_id,
-                                &[close_reason::BLOCKED],
-                            ))
-                            .await;
-                        continue;
-                    }
-                    let task = tokio::spawn(async move {
-                        let _guard = StreamDropGuard {
+                let task = match stype {
+                    ws_stream_type::TCP => {
+                        if disable_raw_tcp || principal.as_ref().is_some_and(|p| !p.allow_raw_tcp) {
+                            send_ws_close(&out_tx, stream_id, close_reason::BLOCKED).await;
+                            continue;
+                        }
+                        spawn_ws_tcp(
+                            guard,
                             stream_id,
-                            done_tx: done_tx_c,
-                        };
-                        let addrs =
-                            match resolve_and_check_target(&host_owned, port, &policy_c).await {
-                                Ok(a) => a,
-                                Err(r) => {
-                                    let _ = out_tx_c
-                                        .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r]))
-                                        .await;
-                                    return;
-                                }
-                            };
-                        let tcp = match tokio::time::timeout(
-                            CONNECT_TIMEOUT,
-                            TcpStream::connect(&addrs[..]),
+                            host.to_string(),
+                            port,
+                            policy.clone(),
+                            in_rx,
+                            out_tx.clone(),
                         )
-                        .await
-                        {
-                            Ok(Ok(s)) => s,
-                            Ok(Err(e)) => {
-                                let r = match e.kind() {
-                                    std::io::ErrorKind::ConnectionRefused => {
-                                        close_reason::CONNECTION_REFUSED
-                                    }
-                                    std::io::ErrorKind::TimedOut => close_reason::CONNECT_TIMEOUT,
-                                    _ => close_reason::UNREACHABLE,
-                                };
-                                let _ = out_tx_c
-                                    .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r]))
-                                    .await;
-                                return;
-                            }
-                            Err(_) => {
-                                let _ = out_tx_c
-                                    .send(encode_ws_packet(
-                                        ws_pkt::CLOSE,
-                                        stream_id,
-                                        &[close_reason::CONNECT_TIMEOUT],
-                                    ))
-                                    .await;
-                                return;
-                            }
-                        };
-                        let _ = tcp.set_nodelay(true);
-                        let (mut tr, mut tw) = tcp.into_split();
-
-                        let out_w = out_tx_c.clone();
-                        let c2s = async move {
-                            let mut received: u32 = 0;
-                            while let Some(chunk) = in_rx.recv().await {
-                                if tw.write_all(&chunk).await.is_err() {
-                                    break;
-                                }
-                                received += 1;
-                                if received >= INITIAL_BUFFER / 2 {
-                                    received = 0;
-                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len())
-                                        as u32;
-                                    let _ = out_w
-                                        .send(encode_ws_packet(
-                                            ws_pkt::CONTINUE,
-                                            stream_id,
-                                            &cap.to_le_bytes(),
-                                        ))
-                                        .await;
-                                }
-                            }
-                        };
-                        let out_r = out_tx_c.clone();
-                        let s2c = async move {
-                            let mut buf = vec![0u8; 32 * 1024];
-                            loop {
-                                match tr.read(&mut buf).await {
-                                    Ok(0) => {
-                                        let _ = out_r
-                                            .send(encode_ws_packet(
-                                                ws_pkt::CLOSE,
-                                                stream_id,
-                                                &[close_reason::VOLUNTARY],
-                                            ))
-                                            .await;
-                                        break;
-                                    }
-                                    Ok(n) => {
-                                        if out_r
-                                            .send(encode_ws_packet(
-                                                ws_pkt::DATA,
-                                                stream_id,
-                                                &buf[..n],
-                                            ))
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        let _ = out_r
-                                            .send(encode_ws_packet(
-                                                ws_pkt::CLOSE,
-                                                stream_id,
-                                                &[close_reason::NETWORK_ERROR],
-                                            ))
-                                            .await;
-                                        break;
-                                    }
-                                }
-                            }
-                        };
-                        tokio::select! {
-                            _ = c2s => {}
-                            _ = s2c => {}
-                        }
-                    });
-                    if let Some(old) = streams.insert(stream_id, StreamEntry { tx: in_tx, task }) {
-                        old.task.abort();
                     }
-                } else if stype == ws_stream_type::UDP {
-                    let task = tokio::spawn(async move {
-                        let _guard = StreamDropGuard {
+                    ws_stream_type::UDP => spawn_ws_udp(
+                        guard,
+                        stream_id,
+                        host.to_string(),
+                        port,
+                        policy.clone(),
+                        in_rx,
+                        out_tx.clone(),
+                    ),
+                    ws_stream_type::HTTP_PROXY => {
+                        let (ap, route) = match AuthProxy::authorize_route(
+                            auth_proxy.as_ref(),
+                            principal.as_deref(),
+                            host,
+                        ) {
+                            Ok(res) => res,
+                            Err(reason) => {
+                                send_ws_close(&out_tx, stream_id, reason).await;
+                                continue;
+                            }
+                        };
+                        spawn_ws_http_proxy(
+                            guard,
                             stream_id,
-                            done_tx: done_tx_c,
-                        };
-                        let addrs =
-                            match resolve_and_check_target(&host_owned, port, &policy_c).await {
-                                Ok(a) => a,
-                                Err(r) => {
-                                    let _ = out_tx_c
-                                        .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[r]))
-                                        .await;
-                                    return;
-                                }
-                            };
-                        let target = addrs[0];
-                        let bind_addr: SocketAddr = if target.is_ipv4() {
-                            "0.0.0.0:0".parse().unwrap()
-                        } else {
-                            "[::]:0".parse().unwrap()
-                        };
-                        let Ok(sock) = UdpSocket::bind(bind_addr).await else {
-                            return;
-                        };
-                        if sock.connect(target).await.is_err() {
-                            return;
-                        }
-                        let sock = Arc::new(sock);
-                        let sock_r = Arc::clone(&sock);
-                        let out_r = out_tx_c.clone();
-                        let c2s = async move {
-                            while let Some(chunk) = in_rx.recv().await {
-                                if sock.send(&chunk).await.is_err() {
-                                    break;
-                                }
-                            }
-                        };
-                        let s2c = async move {
-                            let mut buf = vec![0u8; 4096];
-                            while let Ok(n) = sock_r.recv(&mut buf).await {
-                                if out_r
-                                    .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                        };
-                        tokio::select! {
-                            _ = c2s => {}
-                            _ = s2c => {}
-                        }
-                    });
-                    if let Some(old) = streams.insert(stream_id, StreamEntry { tx: in_tx, task }) {
-                        old.task.abort();
+                            route,
+                            ap,
+                            policy.clone(),
+                            in_rx,
+                            out_tx.clone(),
+                        )
                     }
-                } else if stype == ws_stream_type::HTTP_PROXY {
-                    let (Some(ap), Some(p)) = (auth_proxy.as_ref(), principal.as_ref()) else {
-                        let _ = out_tx
-                            .send(encode_ws_packet(
-                                ws_pkt::CLOSE,
-                                stream_id,
-                                &[close_reason::BLOCKED],
-                            ))
-                            .await;
+                    _ => {
+                        send_ws_close(&out_tx, stream_id, close_reason::INVALID_INFO).await;
                         continue;
-                    };
-                    let Some(route) = ap.get_route(&host_owned, p) else {
-                        let reason = if p.allowed_routes.is_empty() && !ap.principals.is_empty() {
-                            close_reason::AUTH_REQUIRED
-                        } else {
-                            close_reason::BLOCKED
-                        };
-                        let _ = out_tx
-                            .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[reason]))
-                            .await;
-                        continue;
-                    };
-                    let ap_c = Arc::clone(ap);
-                    let task = tokio::spawn(async move {
-                        let _guard = StreamDropGuard {
-                            stream_id,
-                            done_tx: done_tx_c,
-                        };
-                        let (client_io, relay_io) = tokio::io::duplex(64 * 1024);
-                        let (mut rh_read, mut rh_write) = tokio::io::split(relay_io);
-                        let out_w = out_tx_c.clone();
-                        let c2s = async move {
-                            let mut received: u32 = 0;
-                            while let Some(chunk) = in_rx.recv().await {
-                                if rh_write.write_all(&chunk).await.is_err() {
-                                    break;
-                                }
-                                received += 1;
-                                if received >= INITIAL_BUFFER / 2 {
-                                    received = 0;
-                                    let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len())
-                                        as u32;
-                                    let _ = out_w
-                                        .send(encode_ws_packet(
-                                            ws_pkt::CONTINUE,
-                                            stream_id,
-                                            &cap.to_le_bytes(),
-                                        ))
-                                        .await;
-                                }
-                            }
-                            let _ = rh_write.shutdown().await;
-                        };
-                        let out_r = out_tx_c.clone();
-                        let s2c = async move {
-                            let mut buf = vec![0u8; 32 * 1024];
-                            loop {
-                                match rh_read.read(&mut buf).await {
-                                    Ok(0) => {
-                                        let _ = out_r
-                                            .send(encode_ws_packet(
-                                                ws_pkt::CLOSE,
-                                                stream_id,
-                                                &[close_reason::VOLUNTARY],
-                                            ))
-                                            .await;
-                                        break;
-                                    }
-                                    Ok(n) => {
-                                        if out_r
-                                            .send(encode_ws_packet(
-                                                ws_pkt::DATA,
-                                                stream_id,
-                                                &buf[..n],
-                                            ))
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        let _ = out_r
-                                            .send(encode_ws_packet(
-                                                ws_pkt::CLOSE,
-                                                stream_id,
-                                                &[close_reason::NETWORK_ERROR],
-                                            ))
-                                            .await;
-                                        break;
-                                    }
-                                }
-                            }
-                        };
-                        let proxy_fut = handle_http_proxy_io(client_io, route, ap_c, policy_c);
-                        tokio::select! {
-                            _ = proxy_fut => {}
-                            _ = async { tokio::join!(c2s, s2c) } => {}
-                        }
-                    });
-                    if let Some(old) = streams.insert(stream_id, StreamEntry { tx: in_tx, task }) {
-                        old.task.abort();
                     }
+                };
+                if let Some(old) = streams.insert(
+                    stream_id,
+                    StreamEntry {
+                        instance,
+                        tx: in_tx,
+                        task,
+                    },
+                ) {
+                    old.task.abort();
                 }
             }
             ws_pkt::DATA => {
@@ -641,4 +403,168 @@ where
     }
     finish_writer(out_tx, writer_task).await;
     Ok(())
+}
+
+struct StreamDropGuard {
+    stream_id: u32,
+    instance: u64,
+    done_tx: mpsc::Sender<(u32, u64)>,
+}
+
+impl Drop for StreamDropGuard {
+    fn drop(&mut self) {
+        let _ = self.done_tx.try_send((self.stream_id, self.instance));
+    }
+}
+
+async fn send_ws_close(out_tx: &mpsc::Sender<Vec<u8>>, stream_id: u32, reason: u8) {
+    let _ = out_tx
+        .send(encode_ws_packet(ws_pkt::CLOSE, stream_id, &[reason]))
+        .await;
+}
+
+async fn bridge_ws_io<IO: AsyncRead + AsyncWrite + Unpin>(
+    io: IO,
+    stream_id: u32,
+    mut in_rx: mpsc::Receiver<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(io);
+    let out_w = out_tx.clone();
+    let c2s = async move {
+        let mut received: u32 = 0;
+        while let Some(chunk) = in_rx.recv().await {
+            if writer.write_all(&chunk).await.is_err() {
+                break;
+            }
+            received += 1;
+            if received >= INITIAL_BUFFER / 2 {
+                received = 0;
+                let cap = (INITIAL_BUFFER as usize).saturating_sub(in_rx.len()) as u32;
+                let _ = out_w
+                    .send(encode_ws_packet(
+                        ws_pkt::CONTINUE,
+                        stream_id,
+                        &cap.to_le_bytes(),
+                    ))
+                    .await;
+            }
+        }
+        let _ = writer.shutdown().await;
+    };
+    let s2c = async move {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => {
+                    send_ws_close(&out_tx, stream_id, close_reason::VOLUNTARY).await;
+                    break;
+                }
+                Ok(n) => {
+                    if out_tx
+                        .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    send_ws_close(&out_tx, stream_id, close_reason::NETWORK_ERROR).await;
+                    break;
+                }
+            }
+        }
+    };
+    tokio::join!(c2s, s2c);
+}
+
+fn spawn_ws_tcp(
+    guard: StreamDropGuard,
+    stream_id: u32,
+    host: String,
+    port: u16,
+    policy: SecurityPolicy,
+    in_rx: mpsc::Receiver<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _guard = guard;
+        let tcp = match connect_tcp(&host, port, &policy, CONNECT_TIMEOUT).await {
+            Ok(s) => s,
+            Err(r) => {
+                send_ws_close(&out_tx, stream_id, r).await;
+                return;
+            }
+        };
+        let _ = tcp.set_nodelay(true);
+        bridge_ws_io(tcp, stream_id, in_rx, out_tx).await;
+    })
+}
+
+fn spawn_ws_udp(
+    guard: StreamDropGuard,
+    stream_id: u32,
+    host: String,
+    port: u16,
+    policy: SecurityPolicy,
+    mut in_rx: mpsc::Receiver<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _guard = guard;
+        let sock = match connect_udp(&host, port, &policy).await {
+            Ok(s) => Arc::new(s),
+            Err(r) => {
+                send_ws_close(&out_tx, stream_id, r).await;
+                return;
+            }
+        };
+        let sock_r = Arc::clone(&sock);
+        let out_r = out_tx.clone();
+        let c2s = async move {
+            while let Some(chunk) = in_rx.recv().await {
+                if sock.send(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let s2c = async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok(n) = sock_r.recv(&mut buf).await {
+                if out_r
+                    .send(encode_ws_packet(ws_pkt::DATA, stream_id, &buf[..n]))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            _ = c2s => {}
+            _ = s2c => {}
+        }
+    })
+}
+
+fn spawn_ws_http_proxy(
+    guard: StreamDropGuard,
+    stream_id: u32,
+    route: Arc<crate::auth_proxy::CompiledRoute>,
+    ap: Arc<AuthProxy>,
+    policy: SecurityPolicy,
+    in_rx: mpsc::Receiver<Vec<u8>>,
+    out_tx: mpsc::Sender<Vec<u8>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let _guard = guard;
+        let (client_io, relay_io) = tokio::io::duplex(64 * 1024);
+        tokio::join!(
+            async move {
+                let _ = handle_http_proxy_io(client_io, route, ap, policy).await;
+            },
+            bridge_ws_io(relay_io, stream_id, in_rx, out_tx),
+        );
+    })
 }

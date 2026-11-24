@@ -1,4 +1,3 @@
-// oxlint-disable unicorn/prefer-add-event-listener, typescript/no-unsafe-type-assertion, typescript/no-unnecessary-type-assertion
 import {
   EXT_ID,
   WISP_CLOSE_REASON,
@@ -6,12 +5,14 @@ import {
   WS_STREAM_TYPE,
   WispCloseError,
   type WispExtension,
-  decodeAuthProxyRoutes,
+  dataView,
   decodeInfo,
   encodeInfo,
   encodeWsConnectPayload,
   encodeWsPacket,
-  utf8Decode,
+  getGlobalCtor,
+  parseServerInfo,
+  toError,
   utf8Encode,
 } from "./protocol.ts";
 import type {
@@ -35,7 +36,6 @@ interface WsStreamState {
   outBytes: number;
   done: boolean;
   scheduled: boolean;
-  open: boolean;
   onData: (data: Uint8Array) => void;
   onEnd?: () => void;
   onDrain?: () => void;
@@ -57,6 +57,7 @@ export class WispWebSocketSession implements WispSession {
   private initialCredit: number;
   private nextId = 1;
   private closed = false;
+  private closeError: Error | null = null;
   private readonly streams = new Map<number, WsStreamState>();
   private readonly closeListeners: Array<(err: Error | null) => void> = [];
 
@@ -70,6 +71,7 @@ export class WispWebSocketSession implements WispSession {
     this.initialCredit = initialCredit;
     this.motd = motd;
     this.authProxyRoutes = authProxyRoutes;
+    this.ws.onerror = null;
     this.ws.onmessage = (e) => {
       const m = toUint8Array(e.data);
       this.bytesRx += m.length;
@@ -84,10 +86,7 @@ export class WispWebSocketSession implements WispSession {
     url: string,
     opts: Pick<WispClientOptions, "authToken" | "wispVersion" | "WebSocketImpl">,
   ): Promise<WispWebSocketSession> {
-    const WS = (opts.WebSocketImpl ??
-      (globalThis as { WebSocket?: WebSocketConstructor }).WebSocket) as
-      | WebSocketConstructor
-      | undefined;
+    const WS = opts.WebSocketImpl ?? getGlobalCtor<WebSocketConstructor>("WebSocket");
     if (!WS) {
       return Promise.reject(new Error("WebSocket is not available in this environment"));
     }
@@ -120,12 +119,9 @@ export class WispWebSocketSession implements WispSession {
         if (type === WS_PKT.INFO) {
           try {
             const info = decodeInfo(m.subarray(5));
-            for (const ext of info.extensions) {
-              if (ext.id === EXT_ID.MOTD) {
-                motd = utf8Decode(ext.data);
-              }
-            }
-            authProxyRoutes = decodeAuthProxyRoutes(info.extensions);
+            const parsedInfo = parseServerInfo(info.extensions);
+            motd = parsedInfo.motd;
+            authProxyRoutes = parsedInfo.authProxyRoutes;
             const exts: WispExtension[] = [{ id: EXT_ID.UDP, data: new Uint8Array(0) }];
             if (opts.authToken) {
               exts.push({ id: EXT_ID.BEARER_AUTH, data: utf8Encode(opts.authToken) });
@@ -134,13 +130,13 @@ export class WispWebSocketSession implements WispSession {
               encodeWsPacket(WS_PKT.INFO, 0, encodeInfo({ major: 2, minor: 1, extensions: exts })),
             );
           } catch (err) {
-            fail(err instanceof Error ? err : new Error(String(err)));
+            fail(toError(err));
           }
           return;
         }
         if (type === WS_PKT.CONTINUE && m.length >= 9) {
           settled = true;
-          const credit = new DataView(m.buffer, m.byteOffset, m.byteLength).getUint32(5, true);
+          const credit = dataView(m).getUint32(5, true);
           resolve(new WispWebSocketSession(ws, credit, motd, authProxyRoutes));
           return;
         }
@@ -154,7 +150,7 @@ export class WispWebSocketSession implements WispSession {
 
   private onPacket(m: Uint8Array): void {
     if (m.length < 5) return;
-    const dv = new DataView(m.buffer, m.byteOffset, m.byteLength);
+    const dv = dataView(m);
     const id = dv.getUint32(1, true);
     const st = this.streams.get(id);
     if (!st) return;
@@ -170,8 +166,7 @@ export class WispWebSocketSession implements WispSession {
         }
         break;
       case WS_PKT.CLOSE: {
-        const reason =
-          m.length > 5 ? (m[5] ?? WISP_CLOSE_REASON.UNSPECIFIED) : WISP_CLOSE_REASON.UNSPECIFIED;
+        const reason = m[5] ?? WISP_CLOSE_REASON.UNSPECIFIED;
         if (reason === WISP_CLOSE_REASON.VOLUNTARY) {
           st.onEnd?.();
           this.closeStream(id, null);
@@ -233,14 +228,13 @@ export class WispWebSocketSession implements WispSession {
       outBytes: 0,
       done: false,
       scheduled: false,
-      open: true,
       onData: (d) => events.onData(d),
       onEnd: () => events.onEnd(),
       onDrain: () => events.onDrain(),
       onClose: (err) => events.onClose(err),
       pump: () => {
         st.scheduled = false;
-        if (!st.open || st.done || this.closed) return;
+        if (st.done || this.closed) return;
         const before = st.outBytes;
         while (st.out.length > 0 && st.credit > 0) {
           let n = 0;
@@ -283,13 +277,9 @@ export class WispWebSocketSession implements WispSession {
 
     return {
       write(data: Uint8Array) {
-        if (st.done) return;
-        if (data.length <= MAX_PACKET) {
-          st.out.push(data.slice());
-        } else {
-          for (let off = 0; off < data.length; off += MAX_PACKET) {
-            st.out.push(data.slice(off, Math.min(off + MAX_PACKET, data.length)));
-          }
+        if (st.done || data.length === 0) return;
+        for (let off = 0; off < data.length; off += MAX_PACKET) {
+          st.out.push(data.slice(off, Math.min(off + MAX_PACKET, data.length)));
         }
         st.outBytes += data.length;
         if (!st.scheduled) {
@@ -327,7 +317,6 @@ export class WispWebSocketSession implements WispSession {
       outBytes: 0,
       done: false,
       scheduled: false,
-      open: true,
       onData: (d) => events.onMessage(d),
       onClose: (err) => events.onClose(err),
       pump: () => {},
@@ -373,7 +362,7 @@ export class WispWebSocketSession implements WispSession {
 
   onClosed(cb: (err: Error | null) => void): void {
     if (this.closed) {
-      cb(null);
+      cb(this.closeError);
       return;
     }
     this.closeListeners.push(cb);
@@ -382,12 +371,14 @@ export class WispWebSocketSession implements WispSession {
   private handleClosed(err: Error | null): void {
     if (this.closed) return;
     this.closed = true;
+    this.closeError = err;
     for (const id of this.streams.keys()) {
       this.closeStream(id, err);
     }
     for (const cb of this.closeListeners) {
       cb(err);
     }
+    this.closeListeners.length = 0;
   }
 }
 

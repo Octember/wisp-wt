@@ -3,9 +3,7 @@ use crate::protocol::{
     Extension, InfoPayload, close_reason, control_msg, decode_info, decode_varint,
     encode_control_frame, encode_info, encode_varint, ext_id, extract_token_from_info, stream_kind,
 };
-use crate::security::{
-    SecurityPolicy, extract_bearer_header, extract_query_token, resolve_and_check_target,
-};
+use crate::security::{SecurityPolicy, connect_tcp, connect_udp, extract_http_token};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -13,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -80,12 +78,10 @@ async fn handle_incoming(
         return Ok(());
     };
 
-    let http_token = extract_query_token(req.path()).or_else(|| {
-        req.headers()
-            .get("authorization")
-            .and_then(|v| extract_bearer_header(v))
-            .map(str::to_string)
-    });
+    let http_token = extract_http_token(
+        req.path(),
+        req.headers().get("authorization").map(|s| s.as_str()),
+    );
 
     if http_token.is_some() && !policy.verify_token(http_token.as_deref()) {
         warn!(%remote_ip, "Rejected WebTransport session: invalid HTTP token");
@@ -275,7 +271,13 @@ async fn run_wt_session(
                                 let flow_id = u32::from_le_bytes(mpayload[0..4].try_into().unwrap());
                                 let ctrl_send = Arc::clone(&ctrl_send);
                                 tokio::spawn(async move {
-                                    let _ = send_udp_bound(&ctrl_send, flow_id, close_reason::THROTTLED).await;
+                                    let _ = send_udp_ctrl(
+                                        &ctrl_send,
+                                        control_msg::UDP_BOUND,
+                                        flow_id,
+                                        close_reason::THROTTLED,
+                                    )
+                                    .await;
                                 });
                             }
                             continue;
@@ -349,6 +351,23 @@ async fn read_control_frame(recv: &mut RecvStream) -> Result<(u8, Vec<u8>)> {
     Ok((msg_type, payload))
 }
 
+async fn reject_wt_stream(mut send: SendStream, reason: u8) -> Result<()> {
+    let _ = send.write_all(&[reason, 0x00]).await;
+    let _ = send.finish().await;
+    Ok(())
+}
+
+async fn parse_wt_stream_target(recv: &mut RecvStream, len: usize) -> Result<Option<String>> {
+    if len == 0 || len > 1024 {
+        return Ok(None);
+    }
+    let mut bytes = vec![0u8; len];
+    tokio::time::timeout(STREAM_HEADER_TIMEOUT, recv.read_exact(&mut bytes))
+        .await
+        .context("WT stream target read timed out")??;
+    Ok(String::from_utf8(bytes).ok())
+}
+
 async fn handle_tcp_stream(
     mut send: SendStream,
     mut recv: RecvStream,
@@ -369,34 +388,16 @@ async fn handle_tcp_stream(
             .await
             .context("WT HTTP_PROXY header read timed out")??;
         let route_len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        if route_len == 0 || route_len > 1024 {
-            let _ = send.write_all(&[close_reason::INVALID_INFO, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
-        }
-        let mut route_bytes = vec![0u8; route_len];
-        tokio::time::timeout(STREAM_HEADER_TIMEOUT, recv.read_exact(&mut route_bytes))
-            .await
-            .context("WT HTTP_PROXY route read timed out")??;
-        let Ok(route_id) = String::from_utf8(route_bytes) else {
-            let _ = send.write_all(&[close_reason::INVALID_INFO, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
+        let Some(route_id) = parse_wt_stream_target(&mut recv, route_len).await? else {
+            return reject_wt_stream(send, close_reason::INVALID_INFO).await;
         };
-        let (Some(ap), Some(p)) = (auth_proxy, principal) else {
-            let _ = send.write_all(&[close_reason::BLOCKED, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
-        };
-        let Some(route) = ap.get_route(&route_id, &p) else {
-            let reason = if p.allowed_routes.is_empty() && !ap.principals.is_empty() {
-                close_reason::AUTH_REQUIRED
-            } else {
-                close_reason::BLOCKED
-            };
-            let _ = send.write_all(&[reason, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
+        let (ap, route) = match AuthProxy::authorize_route(
+            auth_proxy.as_ref(),
+            principal.as_deref(),
+            &route_id,
+        ) {
+            Ok(res) => res,
+            Err(reason) => return reject_wt_stream(send, reason).await,
         };
         send.write_all(&[0x00, 0x00]).await?;
         let io = tokio::io::join(recv, send);
@@ -404,9 +405,7 @@ async fn handle_tcp_stream(
     }
 
     if kind_buf[0] != stream_kind::TCP {
-        let _ = send.write_all(&[close_reason::INVALID_INFO, 0x00]).await;
-        let _ = send.finish().await;
-        return Ok(());
+        return reject_wt_stream(send, close_reason::INVALID_INFO).await;
     }
 
     let mut hdr_rest = [0u8; 5];
@@ -414,56 +413,17 @@ async fn handle_tcp_stream(
         .await
         .context("WT stream header read timed out")??;
     if disable_raw_tcp || principal.as_ref().is_some_and(|p| !p.allow_raw_tcp) {
-        let _ = send.write_all(&[close_reason::BLOCKED, 0x00]).await;
-        let _ = send.finish().await;
-        return Ok(());
+        return reject_wt_stream(send, close_reason::BLOCKED).await;
     }
     let port = u16::from_le_bytes([hdr_rest[1], hdr_rest[2]]);
     let host_len = u16::from_le_bytes([hdr_rest[3], hdr_rest[4]]) as usize;
-    if host_len == 0 || host_len > 1024 {
-        let _ = send.write_all(&[close_reason::INVALID_INFO, 0x00]).await;
-        let _ = send.finish().await;
-        return Ok(());
-    }
-    let mut host_bytes = vec![0u8; host_len];
-    tokio::time::timeout(STREAM_HEADER_TIMEOUT, recv.read_exact(&mut host_bytes))
-        .await
-        .context("WT stream host read timed out")??;
-    let host = match String::from_utf8(host_bytes) {
-        Ok(h) => h,
-        Err(_) => {
-            let _ = send.write_all(&[close_reason::INVALID_INFO, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
-        }
+    let Some(host) = parse_wt_stream_target(&mut recv, host_len).await? else {
+        return reject_wt_stream(send, close_reason::INVALID_INFO).await;
     };
 
-    let addrs = match resolve_and_check_target(&host, port, &policy).await {
-        Ok(a) => a,
-        Err(reason) => {
-            let _ = send.write_all(&[reason, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
-        }
-    };
-
-    let tcp = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addrs[..])).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            let reason = match e.kind() {
-                std::io::ErrorKind::ConnectionRefused => close_reason::CONNECTION_REFUSED,
-                std::io::ErrorKind::TimedOut => close_reason::CONNECT_TIMEOUT,
-                _ => close_reason::UNREACHABLE,
-            };
-            let _ = send.write_all(&[reason, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
-        }
-        Err(_) => {
-            let _ = send.write_all(&[close_reason::CONNECT_TIMEOUT, 0x00]).await;
-            let _ = send.finish().await;
-            return Ok(());
-        }
+    let tcp = match connect_tcp(&host, port, &policy, CONNECT_TIMEOUT).await {
+        Ok(s) => s,
+        Err(reason) => return reject_wt_stream(send, reason).await,
     };
 
     let _ = tcp.set_nodelay(true);
@@ -540,49 +500,55 @@ async fn handle_udp_bind(
     }
     let flow_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
     if flow_id >= (1 << 30) {
-        send_udp_bound(ctrl_send, flow_id, close_reason::INVALID_INFO).await?;
+        send_udp_ctrl(
+            ctrl_send,
+            control_msg::UDP_BOUND,
+            flow_id,
+            close_reason::INVALID_INFO,
+        )
+        .await?;
         return Ok(());
     }
     if udp_flows.lock().await.len() >= policy.max_streams_per_session {
-        send_udp_bound(ctrl_send, flow_id, close_reason::THROTTLED).await?;
+        send_udp_ctrl(
+            ctrl_send,
+            control_msg::UDP_BOUND,
+            flow_id,
+            close_reason::THROTTLED,
+        )
+        .await?;
         return Ok(());
     }
     let port = u16::from_le_bytes(payload[4..6].try_into().unwrap());
     let host_len = u16::from_le_bytes(payload[6..8].try_into().unwrap()) as usize;
     if payload.len() < 8 + host_len {
-        send_udp_bound(ctrl_send, flow_id, close_reason::INVALID_INFO).await?;
+        send_udp_ctrl(
+            ctrl_send,
+            control_msg::UDP_BOUND,
+            flow_id,
+            close_reason::INVALID_INFO,
+        )
+        .await?;
         return Ok(());
     }
     let Ok(host) = std::str::from_utf8(&payload[8..8 + host_len]) else {
-        send_udp_bound(ctrl_send, flow_id, close_reason::INVALID_INFO).await?;
+        send_udp_ctrl(
+            ctrl_send,
+            control_msg::UDP_BOUND,
+            flow_id,
+            close_reason::INVALID_INFO,
+        )
+        .await?;
         return Ok(());
     };
 
-    let addrs = match resolve_and_check_target(host, port, policy).await {
-        Ok(a) => a,
-        Err(reason) => {
-            send_udp_bound(ctrl_send, flow_id, reason).await?;
-            return Ok(());
-        }
-    };
-
-    let target = addrs[0];
-    let bind_addr: SocketAddr = if target.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let sock = match UdpSocket::bind(bind_addr).await {
+    let sock = match connect_udp(host, port, policy).await {
         Ok(s) => Arc::new(s),
-        Err(_) => {
-            send_udp_bound(ctrl_send, flow_id, close_reason::UNREACHABLE).await?;
+        Err(reason) => {
+            send_udp_ctrl(ctrl_send, control_msg::UDP_BOUND, flow_id, reason).await?;
             return Ok(());
         }
     };
-    if sock.connect(target).await.is_err() {
-        send_udp_bound(ctrl_send, flow_id, close_reason::UNREACHABLE).await?;
-        return Ok(());
-    }
 
     let sock_recv = Arc::clone(&sock);
     let conn_clone = conn.clone();
@@ -605,14 +571,13 @@ async fn handle_udp_bind(
             }
         }
         udp_flows_exit.lock().await.remove(&flow_id);
-        let _ = ctrl_send_exit
-            .lock()
-            .await
-            .write_all(&encode_control_frame(
-                control_msg::UDP_CLOSE,
-                &flow_id.to_le_bytes(),
-            ))
-            .await;
+        let _ = send_udp_ctrl(
+            &ctrl_send_exit,
+            control_msg::UDP_CLOSE,
+            flow_id,
+            close_reason::NETWORK_ERROR,
+        )
+        .await;
     });
 
     if let Some(old) = udp_flows
@@ -622,22 +587,23 @@ async fn handle_udp_bind(
     {
         old.task.abort();
     }
-    send_udp_bound(ctrl_send, flow_id, 0x00).await?;
+    send_udp_ctrl(ctrl_send, control_msg::UDP_BOUND, flow_id, 0x00).await?;
     Ok(())
 }
 
-async fn send_udp_bound(
+async fn send_udp_ctrl(
     ctrl_send: &Arc<Mutex<SendStream>>,
+    msg_type: u8,
     flow_id: u32,
-    status: u8,
+    code: u8,
 ) -> Result<()> {
     let mut payload = [0u8; 5];
     payload[0..4].copy_from_slice(&flow_id.to_le_bytes());
-    payload[4] = status;
+    payload[4] = code;
     ctrl_send
         .lock()
         .await
-        .write_all(&encode_control_frame(control_msg::UDP_BOUND, &payload))
+        .write_all(&encode_control_frame(msg_type, &payload))
         .await?;
     Ok(())
 }

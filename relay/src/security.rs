@@ -1,13 +1,21 @@
 use crate::config::RelayConfig;
-use crate::protocol::close_reason;
+use crate::protocol::{
+    Extension, InfoPayload, close_reason, encode_info, ext_id, extract_token_from_info,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use tokio::net::lookup_host;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpStream, UdpSocket, lookup_host};
 
 #[derive(Clone)]
 pub struct SecurityPolicy {
+    inner: Arc<SecurityPolicyInner>,
+    limiter: Arc<Mutex<RateLimiterState>>,
+}
+
+pub struct SecurityPolicyInner {
     pub allow_origins: Vec<String>,
     pub allow_any_origin: bool,
     pub auth_token: Option<String>,
@@ -20,12 +28,40 @@ pub struct SecurityPolicy {
     pub streams_burst: f64,
     pub sessions_per_sec: f64,
     pub sessions_burst: f64,
-    limiter: Arc<Mutex<RateLimiterState>>,
+}
+
+impl Deref for SecurityPolicy {
+    type Target = SecurityPolicyInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 struct TokenBucket {
     tokens: f64,
     last: Instant,
+}
+
+impl TokenBucket {
+    fn new(burst: f64, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            last: now,
+        }
+    }
+
+    fn try_consume(&mut self, rate: f64, burst: f64, now: Instant) -> bool {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * rate).min(burst);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct RateLimiterState {
@@ -53,8 +89,7 @@ impl Drop for SessionPermit {
 }
 
 pub struct StreamRateLimiter {
-    tokens: f64,
-    last: Instant,
+    bucket: TokenBucket,
     rate: f64,
     burst: f64,
 }
@@ -62,50 +97,47 @@ pub struct StreamRateLimiter {
 impl StreamRateLimiter {
     pub fn new(rate: f64, burst: f64) -> Self {
         Self {
-            tokens: burst,
-            last: Instant::now(),
+            bucket: TokenBucket::new(burst, Instant::now()),
             rate,
             burst,
         }
     }
 
     pub fn allow(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last).as_secs_f64();
-        self.last = now;
-        self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        self.bucket
+            .try_consume(self.rate, self.burst, Instant::now())
     }
 }
 
 impl SecurityPolicy {
     pub fn from_config(cfg: &RelayConfig) -> Self {
         Self {
-            allow_origins: cfg.allow_origins.clone(),
-            allow_any_origin: cfg.allow_any_origin,
-            auth_token: cfg.auth_token.clone(),
-            allow_loopback: cfg.allow_loopback,
-            block_hosts: cfg
-                .block_hosts
-                .iter()
-                .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
-                .collect(),
-            allow_hosts: cfg
-                .allow_hosts
-                .iter()
-                .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
-                .collect(),
-            max_sessions_per_ip: cfg.max_sessions_per_ip,
-            max_streams_per_session: cfg.max_streams_per_session,
-            streams_per_sec: cfg.streams_per_sec,
-            streams_burst: cfg.streams_burst,
-            sessions_per_sec: cfg.sessions_per_sec,
-            sessions_burst: cfg.sessions_burst,
+            inner: Arc::new(SecurityPolicyInner {
+                allow_origins: cfg
+                    .allow_origins
+                    .iter()
+                    .map(|s| s.to_ascii_lowercase())
+                    .collect(),
+                allow_any_origin: cfg.allow_any_origin,
+                auth_token: cfg.auth_token.clone(),
+                allow_loopback: cfg.allow_loopback,
+                block_hosts: cfg
+                    .block_hosts
+                    .iter()
+                    .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
+                    .collect(),
+                allow_hosts: cfg
+                    .allow_hosts
+                    .iter()
+                    .map(|s| s.trim_end_matches('.').to_ascii_lowercase())
+                    .collect(),
+                max_sessions_per_ip: cfg.max_sessions_per_ip,
+                max_streams_per_session: cfg.max_streams_per_session,
+                streams_per_sec: cfg.streams_per_sec,
+                streams_burst: cfg.streams_burst,
+                sessions_per_sec: cfg.sessions_per_sec,
+                sessions_burst: cfg.sessions_burst,
+            }),
             limiter: Arc::new(Mutex::new(RateLimiterState {
                 session_counts: HashMap::new(),
                 session_buckets: HashMap::new(),
@@ -121,9 +153,8 @@ impl SecurityPolicy {
             return false;
         };
         let origin_lower = origin.to_ascii_lowercase();
-        for allowed in &self.allow_origins {
-            let a = allowed.to_ascii_lowercase();
-            if a == origin_lower {
+        for a in &self.allow_origins {
+            if a == &origin_lower {
                 return true;
             }
             if let Some((scheme, rest)) = a.split_once("://*.") {
@@ -172,36 +203,28 @@ impl SecurityPolicy {
         let mut guard = self.limiter.lock().ok()?;
         let now = Instant::now();
         if guard.session_buckets.len() > 1024 {
-            let stale_after = std::time::Duration::from_secs(300);
-            let counts = &guard.session_counts;
-            let mut stale_ips = Vec::new();
-            for (k, b) in &guard.session_buckets {
-                if !counts.contains_key(k) && now.duration_since(b.last) > stale_after {
-                    stale_ips.push(*k);
-                }
-            }
-            for k in stale_ips {
-                guard.session_buckets.remove(&k);
-            }
+            let stale_after = Duration::from_secs(300);
+            let RateLimiterState {
+                session_counts,
+                session_buckets,
+            } = &mut *guard;
+            session_buckets.retain(|k, b| {
+                session_counts.contains_key(k) || now.duration_since(b.last) <= stale_after
+            });
         }
         let active = guard.session_counts.get(&ip).copied().unwrap_or(0);
         if active >= self.max_sessions_per_ip {
             return None;
         }
+        let burst = self.sessions_burst;
+        let rate = self.sessions_per_sec;
         let bucket = guard
             .session_buckets
             .entry(ip)
-            .or_insert_with(|| TokenBucket {
-                tokens: self.sessions_burst,
-                last: now,
-            });
-        let elapsed = now.duration_since(bucket.last).as_secs_f64();
-        bucket.last = now;
-        bucket.tokens = (bucket.tokens + elapsed * self.sessions_per_sec).min(self.sessions_burst);
-        if bucket.tokens < 1.0 {
+            .or_insert_with(|| TokenBucket::new(burst, now));
+        if !bucket.try_consume(rate, burst, now) {
             return None;
         }
-        bucket.tokens -= 1.0;
         guard.session_counts.insert(ip, active + 1);
         Some(SessionPermit {
             ip,
@@ -211,6 +234,30 @@ impl SecurityPolicy {
 
     pub fn new_stream_limiter(&self) -> StreamRateLimiter {
         StreamRateLimiter::new(self.streams_per_sec, self.streams_burst)
+    }
+
+    pub fn check_info_auth(&self, http_token: Option<&str>, info: &InfoPayload) -> bool {
+        if !self.requires_auth() || http_token.is_some() {
+            return true;
+        }
+        let info_token = extract_token_from_info(info);
+        self.verify_token(info_token.as_deref())
+    }
+
+    pub fn build_server_info(&self, version_major: u8, version_minor: u8) -> Vec<u8> {
+        let extensions = if self.requires_auth() {
+            vec![Extension {
+                id: ext_id::PASSWORD_AUTH,
+                data: Vec::new(),
+            }]
+        } else {
+            Vec::new()
+        };
+        encode_info(&InfoPayload {
+            major: version_major,
+            minor: version_minor,
+            extensions,
+        })
     }
 }
 
@@ -239,11 +286,76 @@ pub fn extract_query_token(path_and_query: &str) -> Option<String> {
 }
 
 pub fn extract_bearer_header(header_val: &str) -> Option<&str> {
-    header_val
-        .strip_prefix("Bearer ")
-        .or_else(|| header_val.strip_prefix("bearer "))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    let (scheme, rest) = header_val.split_once(' ')?;
+    if !matches!(scheme, "Bearer" | "bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    (!token.is_empty()).then_some(token)
+}
+
+pub fn extract_http_token(path_and_query: &str, auth_header: Option<&str>) -> Option<String> {
+    extract_query_token(path_and_query).or_else(|| {
+        auth_header
+            .and_then(extract_bearer_header)
+            .map(str::to_string)
+    })
+}
+
+fn host_matches(host: &str, pattern: &str) -> bool {
+    host == pattern
+        || host
+            .strip_suffix(pattern)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+pub async fn connect_tcp(
+    host: &str,
+    port: u16,
+    policy: &SecurityPolicy,
+    timeout: Duration,
+) -> std::result::Result<TcpStream, u8> {
+    let addrs = resolve_and_check_target(host, port, policy).await?;
+    let mut last_err = close_reason::UNREACHABLE;
+    for addr in addrs {
+        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => {
+                last_err = if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                    close_reason::CONNECTION_REFUSED
+                } else {
+                    close_reason::UNREACHABLE
+                };
+            }
+            Err(_) => {
+                last_err = close_reason::CONNECT_TIMEOUT;
+            }
+        }
+    }
+    Err(last_err)
+}
+
+pub async fn connect_udp(
+    host: &str,
+    port: u16,
+    policy: &SecurityPolicy,
+) -> std::result::Result<UdpSocket, u8> {
+    let addrs = resolve_and_check_target(host, port, policy).await?;
+    let mut last_err = close_reason::UNREACHABLE;
+    for addr in addrs {
+        let bind_addr: SocketAddr = if addr.is_ipv4() {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        if let Ok(sock) = UdpSocket::bind(bind_addr).await {
+            if sock.connect(addr).await.is_ok() {
+                return Ok(sock);
+            }
+            last_err = close_reason::UNREACHABLE;
+        }
+    }
+    Err(last_err)
 }
 
 pub async fn resolve_and_check_target(
@@ -262,7 +374,7 @@ pub async fn resolve_and_check_target(
     if policy
         .block_hosts
         .iter()
-        .any(|b| host_lower == *b || host_lower.ends_with(&format!(".{b}")))
+        .any(|b| host_matches(&host_lower, b))
     {
         return Err(close_reason::BLOCKED);
     }
@@ -270,7 +382,7 @@ pub async fn resolve_and_check_target(
         && !policy
             .allow_hosts
             .iter()
-            .any(|a| host_lower == *a || host_lower.ends_with(&format!(".{a}")))
+            .any(|a| host_matches(&host_lower, a))
     {
         return Err(close_reason::BLOCKED);
     }
@@ -335,10 +447,13 @@ fn is_disallowed_v6(ip: Ipv6Addr) -> bool {
         || (segs[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
         || (segs[0] & 0xffc0) == 0xfe80 // Link-local fe80::/10
         || (segs[0] & 0xffc0) == 0xfec0 // Site-local fec0::/10
-        || (segs[0] == 0 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0) // ::/96
-        || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0) // 64:ff9b::/96
-        || (segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001) // 64:ff9b:1::/48
-        || segs[0] == 0x2002 // 2002::/16 (6to4)
-        || (segs[0] == 0x2001 && segs[1] == 0) // 2001::/32 (Teredo)
-        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // 2001:db8::/32 (Documentation)
+        || matches!(
+            segs,
+            [0, 0, 0, 0, 0, 0, ..] // ::/96
+                | [0x0064, 0xff9b, 0, 0, 0, 0, ..] // 64:ff9b::/96
+                | [0x0064, 0xff9b, 0x0001, ..] // 64:ff9b:1::/48
+                | [0x2002, ..] // 2002::/16 (6to4)
+                | [0x2001, 0, ..] // 2001::/32 (Teredo)
+                | [0x2001, 0x0db8, ..] // 2001:db8::/32 (Documentation)
+        )
 }

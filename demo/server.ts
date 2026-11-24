@@ -32,8 +32,11 @@ const bundledJs = await buildClientBundle();
 const alpinePath = await fetchDistro("alpine");
 
 function resolveUnkernelAsset(filename: string): string {
-  const local = join(PKG_DIR, "node_modules/unkernel/dist", filename);
-  return local;
+  return join(PKG_DIR, "node_modules/unkernel/dist", filename);
+}
+
+function withCoop(headers: Record<string, string> = {}): Record<string, string> {
+  return { ...headers, ...COOP_COEP_HEADERS };
 }
 
 const server = Bun.serve({
@@ -45,22 +48,22 @@ const server = Bun.serve({
 
     if (path === "/" || path === "/index.html") {
       return new Response(Bun.file(join(DEMO_DIR, "index.html")), {
-        headers: { "Content-Type": "text/html; charset=utf-8", ...COOP_COEP_HEADERS },
+        headers: withCoop({ "Content-Type": "text/html; charset=utf-8" }),
       });
     }
     if (path === "/style.css") {
       return new Response(Bun.file(join(DEMO_DIR, "style.css")), {
-        headers: { "Content-Type": "text/css; charset=utf-8", ...COOP_COEP_HEADERS },
+        headers: withCoop({ "Content-Type": "text/css; charset=utf-8" }),
       });
     }
     if (path === "/main.js") {
       return new Response(bundledJs, {
-        headers: { "Content-Type": "application/javascript; charset=utf-8", ...COOP_COEP_HEADERS },
+        headers: withCoop({ "Content-Type": "application/javascript; charset=utf-8" }),
       });
     }
     if (path === "/unkernel.wasm" || path === "/dist/unkernel.wasm") {
       return new Response(Bun.file(resolveUnkernelAsset("unkernel.wasm")), {
-        headers: { "Content-Type": "application/wasm", ...COOP_COEP_HEADERS },
+        headers: withCoop({ "Content-Type": "application/wasm" }),
       });
     }
     if (path === "/alpine.img") {

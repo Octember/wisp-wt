@@ -601,3 +601,167 @@ async fn auth_proxy_end_to_end_and_disable_raw_tcp() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&cfg_path);
     Ok(())
 }
+
+#[tokio::test]
+async fn ws_stream_id_replacement_safety() -> Result<()> {
+    let echo_addr = spawn_tcp_echo().await?;
+
+    let cfg = RelayConfig {
+        allow_loopback: true,
+        allow_any_origin: true,
+        ..Default::default()
+    };
+    let policy = SecurityPolicy::from_config(&cfg);
+
+    let ws_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let ws_listener = tokio::net::TcpListener::bind(ws_bind).await?;
+    let ws_addr = ws_listener.local_addr()?;
+    drop(ws_listener);
+
+    tokio::spawn(async move {
+        let _ =
+            wisp_wt_relay::ws_server::run_ws_server(ws_addr, None, policy, None, None, false).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{ws_addr}/")).await?;
+    let init = ws.next().await.unwrap()?;
+    let Message::Binary(init_b) = init else {
+        panic!("Expected binary CONTINUE");
+    };
+    assert_eq!(init_b[0], ws_pkt::CONTINUE);
+
+    let mut connect_payload = vec![ws_stream_type::TCP];
+    connect_payload.extend_from_slice(&echo_addr.port().to_le_bytes());
+    connect_payload.extend_from_slice(b"127.0.0.1");
+
+    // Open stream 1, then immediately replace stream 1 with a new CONNECT.
+    ws.send(Message::Binary(
+        encode_ws_packet(ws_pkt::CONNECT, 1, &connect_payload).into(),
+    ))
+    .await?;
+    ws.send(Message::Binary(
+        encode_ws_packet(ws_pkt::CONNECT, 1, &connect_payload).into(),
+    ))
+    .await?;
+
+    // Give the aborted first task's StreamDropGuard time to run.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Stream 1 must still be active in the relay's map.
+    ws.send(Message::Binary(
+        encode_ws_packet(ws_pkt::DATA, 1, b"hello-replacement").into(),
+    ))
+    .await?;
+
+    let mut echoed = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let Some(Ok(Message::Binary(pkt))) = ws.next().await else {
+            break;
+        };
+        if pkt.len() >= 5 && pkt[0] == ws_pkt::DATA && pkt[1..5] == 1u32.to_le_bytes() {
+            echoed.extend_from_slice(&pkt[5..]);
+            if echoed == b"hello-replacement" {
+                break;
+            }
+        }
+    }
+    assert_eq!(echoed, b"hello-replacement");
+    Ok(())
+}
+
+async fn read_ctrl(recv: &mut wtransport::RecvStream) -> Result<(u8, Vec<u8>)> {
+    let mut hdr = [0u8; 5];
+    recv.read_exact(&mut hdr).await?;
+    let len = u32::from_le_bytes(hdr[1..5].try_into().unwrap()) as usize;
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload).await?;
+    Ok((hdr[0], payload))
+}
+
+#[tokio::test]
+async fn wt_udp_close_is_5_bytes() -> Result<()> {
+    let closed_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let closed_port = closed_sock.local_addr()?.port();
+    drop(closed_sock);
+
+    let tls = load_or_generate_tls(None, None, true, &[])?;
+    let hash_bytes = tls.cert_sha256;
+    let cfg = RelayConfig {
+        allow_loopback: true,
+        allow_any_origin: true,
+        ..Default::default()
+    };
+    let policy = SecurityPolicy::from_config(&cfg);
+
+    let wt_sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let wt_addr = wt_sock.local_addr()?;
+    drop(wt_sock);
+
+    tokio::spawn(async move {
+        let _ = wisp_wt_relay::wt_server::run_wt_server(
+            wt_addr,
+            tls.identity,
+            policy,
+            None,
+            None,
+            false,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client_cfg = wtransport::ClientConfig::builder()
+        .with_bind_default()
+        .with_server_certificate_hashes([wtransport::tls::Sha256Digest::new(hash_bytes)])
+        .build();
+    let endpoint = wtransport::Endpoint::client(client_cfg)?;
+    let conn = endpoint.connect(format!("https://{wt_addr}/")).await?;
+
+    let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?.await?;
+    ctrl_send.write_all(&[stream_kind::CONTROL]).await?;
+    let info_bytes = encode_info(&InfoPayload {
+        major: 2,
+        minor: 1,
+        extensions: vec![],
+    });
+    ctrl_send
+        .write_all(&encode_control_frame(control_msg::INFO, &info_bytes))
+        .await?;
+    let (msg_type, _) = read_ctrl(&mut ctrl_recv).await?;
+    assert_eq!(msg_type, control_msg::INFO);
+    let (msg_type, _) = read_ctrl(&mut ctrl_recv).await?;
+    assert_eq!(msg_type, control_msg::READY);
+
+    let flow_id = 7u32;
+    let mut open_payload = Vec::new();
+    open_payload.extend_from_slice(&flow_id.to_le_bytes());
+    open_payload.extend_from_slice(&closed_port.to_le_bytes());
+    open_payload.extend_from_slice(&(9u16).to_le_bytes());
+    open_payload.extend_from_slice(b"127.0.0.1");
+    ctrl_send
+        .write_all(&encode_control_frame(control_msg::UDP_BIND, &open_payload))
+        .await?;
+
+    let (msg_type, bound_payload) = read_ctrl(&mut ctrl_recv).await?;
+    assert_eq!(msg_type, control_msg::UDP_BOUND);
+    assert_eq!(bound_payload.len(), 5);
+    assert_eq!(bound_payload[4], 0x00);
+
+    let mut dgram = Vec::new();
+    encode_varint(flow_id as u64, &mut dgram)?;
+    dgram.extend_from_slice(b"trigger-icmp");
+    conn.send_datagram(dgram)?;
+
+    let (msg_type, close_payload) =
+        tokio::time::timeout(Duration::from_secs(2), read_ctrl(&mut ctrl_recv)).await??;
+    assert_eq!(msg_type, control_msg::UDP_CLOSE);
+    assert_eq!(close_payload.len(), 5);
+    assert_eq!(
+        u32::from_le_bytes(close_payload[0..4].try_into().unwrap()),
+        flow_id
+    );
+    assert_eq!(close_payload[4], close_reason::NETWORK_ERROR);
+    Ok(())
+}

@@ -44,24 +44,30 @@ pub fn load_or_generate_tls(
         .context("Certificate chain must contain at least one certificate")?;
     let digest: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
     let cert_sha256_base64 = STANDARD.encode(digest);
-    let cert_sha256_hex = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let mut cert_sha256_hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut cert_sha256_hex, "{b:02x}");
+    }
 
     let wt_certs: Vec<wtransport::tls::Certificate> = certs
         .iter()
         .map(|c| wtransport::tls::Certificate::from_der(c.as_ref().to_vec()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Invalid DER certificate for wtransport: {e}"))?;
-    let wt_key = wtransport::tls::PrivateKey::from_der_pkcs8(key.secret_der().to_vec());
+    let wt_key = match &key {
+        PrivateKeyDer::Pkcs8(k) => {
+            wtransport::tls::PrivateKey::from_der_pkcs8(k.secret_pkcs8_der().to_vec())
+        }
+        _ => bail!("Private key must be in PKCS#8 format"),
+    };
     let wt_chain = wtransport::tls::CertificateChain::new(wt_certs);
     let identity = Identity::new(wt_chain, wt_key);
 
     let rustls_config = Arc::new(
         rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(certs, key.clone_key())
+            .with_single_cert(certs, key)
             .context("Failed to build rustls ServerConfig")?,
     );
 

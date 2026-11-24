@@ -1,4 +1,3 @@
-// oxlint-disable typescript/no-unsafe-type-assertion
 import { createKernel } from "unkernel/web";
 import {
   wispWtBackend,
@@ -12,17 +11,23 @@ interface RelayInfoResponse {
   wsPort: number;
 }
 
-const termEl = document.getElementById("terminal") as HTMLPreElement;
-const modeSelect = document.getElementById("mode-select") as HTMLSelectElement;
-const hudTransport = document.getElementById("hud-transport") as HTMLElement;
-const hudHandshake = document.getElementById("hud-handshake") as HTMLElement;
-const hudStreams = document.getElementById("hud-streams") as HTMLElement;
-const hudBytes = document.getElementById("hud-bytes") as HTMLElement;
-const hudReason = document.getElementById("hud-reason") as HTMLElement;
-const btnCurl = document.getElementById("btn-curl") as HTMLButtonElement;
-const btnGit = document.getElementById("btn-git") as HTMLButtonElement;
-const btnParallel = document.getElementById("btn-parallel") as HTMLButtonElement;
-const btnClear = document.getElementById("btn-clear") as HTMLButtonElement;
+function byId<T extends HTMLElement>(id: string): T {
+  const el = document.getElementById(id);
+  if (!el) throw new Error(`Missing element #${id}`);
+  return el as T;
+}
+
+const termEl = byId<HTMLPreElement>("terminal");
+const modeSelect = byId<HTMLSelectElement>("mode-select");
+const hudTransport = byId<HTMLElement>("hud-transport");
+const hudHandshake = byId<HTMLElement>("hud-handshake");
+const hudStreams = byId<HTMLElement>("hud-streams");
+const hudBytes = byId<HTMLElement>("hud-bytes");
+const hudReason = byId<HTMLElement>("hud-reason");
+const btnCurl = byId<HTMLButtonElement>("btn-curl");
+const btnGit = byId<HTMLButtonElement>("btn-git");
+const btnParallel = byId<HTMLButtonElement>("btn-parallel");
+const btnClear = byId<HTMLButtonElement>("btn-clear");
 
 function appendLog(text: string): void {
   termEl.textContent += text;

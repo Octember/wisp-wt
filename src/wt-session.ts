@@ -1,4 +1,3 @@
-// oxlint-disable typescript/no-unsafe-type-assertion, typescript/no-unnecessary-type-assertion, eslint/no-unmodified-loop-condition
 import {
   CONTROL_MSG,
   EXT_ID,
@@ -6,7 +5,7 @@ import {
   WISP_CLOSE_REASON,
   WispCloseError,
   type WispExtension,
-  decodeAuthProxyRoutes,
+  dataView,
   decodeInfo,
   decodeVarint,
   encodeControlFrame,
@@ -16,9 +15,10 @@ import {
   encodeUdpBindPayload,
   encodeUdpClosePayload,
   encodeVarint,
-  utf8Decode,
+  getGlobalCtor,
+  parseServerInfo,
+  toError,
   utf8Encode,
-  varintLength,
 } from "./protocol.ts";
 import type {
   AuthProxyRoute,
@@ -59,6 +59,8 @@ export class WispWebTransportSession implements WispSession {
   private ctrlReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private dgramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private closed = false;
+  private closeError: Error | null = null;
+  private ctrlRemainder: Uint8Array | null = null;
   private readonly closeListeners: Array<(err: Error | null) => void> = [];
   private nextFlowId = 1;
   private readonly pendingUdpBinds = new Map<number, PendingUdpBind>();
@@ -72,10 +74,7 @@ export class WispWebTransportSession implements WispSession {
     url: string,
     opts: Pick<WispClientOptions, "serverCertificateHashes" | "authToken" | "WebTransportImpl">,
   ): Promise<WispWebTransportSession> {
-    const WT = (opts.WebTransportImpl ??
-      (globalThis as { WebTransport?: WebTransportConstructor }).WebTransport) as
-      | WebTransportConstructor
-      | undefined;
+    const WT = opts.WebTransportImpl ?? getGlobalCtor<WebTransportConstructor>("WebTransport");
     if (!WT) {
       throw new Error("WebTransport is not available in this environment");
     }
@@ -123,12 +122,9 @@ export class WispWebTransportSession implements WispSession {
       throw new Error(`Expected SERVER_INFO (0x05), got 0x${serverInfoFrame.type.toString(16)}`);
     }
     const info = decodeInfo(serverInfoFrame.payload);
-    for (const ext of info.extensions) {
-      if (ext.id === EXT_ID.MOTD) {
-        this.motd = utf8Decode(ext.data);
-      }
-    }
-    this.authProxyRoutes = decodeAuthProxyRoutes(info.extensions);
+    const parsedInfo = parseServerInfo(info.extensions);
+    this.motd = parsedInfo.motd;
+    this.authProxyRoutes = parsedInfo.authProxyRoutes;
 
     const readyFrame = await this.readControlFrame();
     if (readyFrame.type === CONTROL_MSG.CLOSE) {
@@ -137,12 +133,7 @@ export class WispWebTransportSession implements WispSession {
     if (readyFrame.type !== CONTROL_MSG.READY || readyFrame.payload.length < 6) {
       throw new Error(`Expected READY (0x03), got 0x${readyFrame.type.toString(16)}`);
     }
-    const dv = new DataView(
-      readyFrame.payload.buffer,
-      readyFrame.payload.byteOffset,
-      readyFrame.payload.byteLength,
-    );
-    const serverMaxDgram = dv.getUint16(4, true);
+    const serverMaxDgram = dataView(readyFrame.payload).getUint16(4, true);
     const nativeMaxDgram = this.transport.datagrams.maxDatagramSize ?? serverMaxDgram;
     this.maxDatagramSize = Math.min(serverMaxDgram || 1200, nativeMaxDgram || 1200);
 
@@ -150,16 +141,27 @@ export class WispWebTransportSession implements WispSession {
     void this.runDatagramLoop();
     void this.transport.closed.then(
       () => this.handleSessionClosed(null),
-      (err) => this.handleSessionClosed(err instanceof Error ? err : new Error(String(err))),
+      (err) => this.handleSessionClosed(toError(err)),
     );
   }
 
-  private async readExactFromControl(len: number): Promise<Uint8Array> {
+  private async readControlBytes(len: number): Promise<Uint8Array> {
+    if (this.ctrlRemainder && this.ctrlRemainder.length >= len) {
+      const slice = this.ctrlRemainder.subarray(0, len);
+      this.ctrlRemainder =
+        this.ctrlRemainder.length > len ? this.ctrlRemainder.subarray(len) : null;
+      return slice;
+    }
     if (!this.ctrlReader) {
       throw new Error("Control stream closed");
     }
     const out = new Uint8Array(len);
     let offset = 0;
+    if (this.ctrlRemainder && this.ctrlRemainder.length > 0) {
+      out.set(this.ctrlRemainder, 0);
+      offset = this.ctrlRemainder.length;
+      this.ctrlRemainder = null;
+    }
     while (offset < len) {
       const { value, done } = await this.ctrlReader.read();
       if (done || !value) {
@@ -169,7 +171,6 @@ export class WispWebTransportSession implements WispSession {
       out.set(value.subarray(0, take), offset);
       offset += take;
       if (take < value.length) {
-        // Control frames are small and sequential; buffer remainder if coalesced.
         this.ctrlRemainder = value.subarray(take);
         break;
       }
@@ -177,31 +178,10 @@ export class WispWebTransportSession implements WispSession {
     return out;
   }
 
-  private ctrlRemainder: Uint8Array | null = null;
-
-  private async readControlBytes(len: number): Promise<Uint8Array> {
-    if (this.ctrlRemainder && this.ctrlRemainder.length > 0) {
-      if (this.ctrlRemainder.length >= len) {
-        const slice = this.ctrlRemainder.subarray(0, len);
-        this.ctrlRemainder =
-          this.ctrlRemainder.length > len ? this.ctrlRemainder.subarray(len) : null;
-        return slice;
-      }
-      const out = new Uint8Array(len);
-      out.set(this.ctrlRemainder, 0);
-      const firstLen = this.ctrlRemainder.length;
-      this.ctrlRemainder = null;
-      const rest = await this.readExactFromControl(len - firstLen);
-      out.set(rest, firstLen);
-      return out;
-    }
-    return this.readExactFromControl(len);
-  }
-
   private async readControlFrame(): Promise<{ type: number; payload: Uint8Array }> {
     const hdr = await this.readControlBytes(5);
     const type = hdr[0] ?? 0;
-    const len = new DataView(hdr.buffer, hdr.byteOffset, hdr.byteLength).getUint32(1, true);
+    const len = dataView(hdr).getUint32(1, true);
     if (len > MAX_CONTROL_FRAME_BYTES) {
       throw new Error(`Control frame too large: ${len} bytes`);
     }
@@ -214,12 +194,7 @@ export class WispWebTransportSession implements WispSession {
       while (!this.closed) {
         const frame = await this.readControlFrame();
         if (frame.type === CONTROL_MSG.UDP_BOUND && frame.payload.length >= 5) {
-          const dv = new DataView(
-            frame.payload.buffer,
-            frame.payload.byteOffset,
-            frame.payload.byteLength,
-          );
-          const flowId = dv.getUint32(0, true);
+          const flowId = dataView(frame.payload).getUint32(0, true);
           const status = frame.payload[4] ?? WISP_CLOSE_REASON.UNSPECIFIED;
           const pending = this.pendingUdpBinds.get(flowId);
           if (pending) {
@@ -231,22 +206,12 @@ export class WispWebTransportSession implements WispSession {
             }
           }
         } else if (frame.type === CONTROL_MSG.UDP_CLOSE && frame.payload.length >= 5) {
-          const dv = new DataView(
-            frame.payload.buffer,
-            frame.payload.byteOffset,
-            frame.payload.byteLength,
-          );
-          const flowId = dv.getUint32(0, true);
+          const flowId = dataView(frame.payload).getUint32(0, true);
           const reason = frame.payload[4] ?? WISP_CLOSE_REASON.UNSPECIFIED;
-          const flow = this.udpFlows.get(flowId);
-          if (flow && !flow.closed) {
-            flow.closed = true;
-            this.udpFlows.delete(flowId);
-            this.activeUdpFlows = Math.max(0, this.activeUdpFlows - 1);
-            flow.events.onClose(
-              reason === WISP_CLOSE_REASON.VOLUNTARY ? null : new WispCloseError(reason),
-            );
-          }
+          this.closeUdpFlow(
+            flowId,
+            reason === WISP_CLOSE_REASON.VOLUNTARY ? null : new WispCloseError(reason),
+          );
         } else if (frame.type === CONTROL_MSG.CLOSE) {
           const reason = frame.payload[0] ?? WISP_CLOSE_REASON.UNSPECIFIED;
           this.handleSessionClosed(
@@ -257,7 +222,7 @@ export class WispWebTransportSession implements WispSession {
       }
     } catch (err) {
       if (!this.closed) {
-        this.handleSessionClosed(err instanceof Error ? err : new Error(String(err)));
+        this.handleSessionClosed(toError(err));
       }
     }
   }
@@ -472,10 +437,10 @@ export class WispWebTransportSession implements WispSession {
     let ready = false;
     const queued: Uint8Array[] = [];
 
+    const prefix = encodeVarint(flowId);
     const sendRaw = (data: Uint8Array) => {
       if (entry.closed || this.closed) return;
-      const prefix = encodeVarint(flowId);
-      const maxPayload = (this.maxDatagramSize ?? 1200) - varintLength(flowId);
+      const maxPayload = (this.maxDatagramSize ?? 1200) - prefix.length;
       if (data.length > maxPayload) {
         return;
       }
@@ -505,12 +470,7 @@ export class WispWebTransportSession implements WispSession {
           sendRaw(queued.shift()!);
         }
       } catch (err) {
-        if (!entry.closed) {
-          entry.closed = true;
-          this.udpFlows.delete(flowId);
-          this.activeUdpFlows = Math.max(0, this.activeUdpFlows - 1);
-          events.onClose(err instanceof Error ? err : new Error(String(err)));
-        }
+        this.closeUdpFlow(flowId, toError(err));
       }
     })();
 
@@ -526,17 +486,25 @@ export class WispWebTransportSession implements WispSession {
       },
       close: () => {
         if (entry.closed) return;
-        entry.closed = true;
-        this.udpFlows.delete(flowId);
-        this.activeUdpFlows = Math.max(0, this.activeUdpFlows - 1);
+        this.pendingUdpBinds.delete(flowId);
+        queued.length = 0;
+        this.closeUdpFlow(flowId, null);
         if (this.ctrlWriter && !this.closed) {
           void this.ctrlWriter
             .write(encodeControlFrame(CONTROL_MSG.UDP_CLOSE, encodeUdpClosePayload(flowId)))
             .catch(() => {});
         }
-        events.onClose(null);
       },
     };
+  }
+
+  private closeUdpFlow(flowId: number, err: Error | null): void {
+    const flow = this.udpFlows.get(flowId);
+    if (!flow || flow.closed) return;
+    flow.closed = true;
+    this.udpFlows.delete(flowId);
+    this.activeUdpFlows = Math.max(0, this.activeUdpFlows - 1);
+    flow.events.onClose(err);
   }
 
   close(): void {
@@ -550,7 +518,7 @@ export class WispWebTransportSession implements WispSession {
 
   onClosed(cb: (err: Error | null) => void): void {
     if (this.closed) {
-      cb(null);
+      cb(this.closeError);
       return;
     }
     this.closeListeners.push(cb);
@@ -559,6 +527,7 @@ export class WispWebTransportSession implements WispSession {
   private handleSessionClosed(err: Error | null): void {
     if (this.closed) return;
     this.closed = true;
+    this.closeError = err;
     for (const [, pending] of this.pendingUdpBinds) {
       pending.reject(err ?? new Error("Session closed"));
     }
@@ -574,5 +543,6 @@ export class WispWebTransportSession implements WispSession {
     for (const cb of this.closeListeners) {
       cb(err);
     }
+    this.closeListeners.length = 0;
   }
 }

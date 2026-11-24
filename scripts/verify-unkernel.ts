@@ -64,14 +64,14 @@ async function main() {
 
     const vm = await createKernel({ distro, net });
     try {
-    const wgetRes = await vm.exec("/bin/sh", [
-      "-c",
-      "wget -S -O - http://example.com 2>&1 | head -n 10",
-    ]);
-    console.log("wget exit:", wgetRes.exitCode, "\n" + wgetRes.stdout);
-    if (wgetRes.exitCode !== 0 || !wgetRes.stdout.includes("HTTP/")) {
-      throw new Error(`wget failed: ${wgetRes.stderr}`);
-    }
+      const wgetRes = await vm.exec("/bin/sh", [
+        "-c",
+        "wget -S -O - http://example.com 2>&1 | head -n 10",
+      ]);
+      console.log("wget exit:", wgetRes.exitCode, "\n" + wgetRes.stdout);
+      if (wgetRes.exitCode !== 0 || !wgetRes.stdout.includes("HTTP/")) {
+        throw new Error(`wget failed: ${wgetRes.stderr}`);
+      }
     } finally {
       net.close();
       await vm.stop();

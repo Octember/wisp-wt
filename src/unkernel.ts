@@ -63,7 +63,7 @@ export function wispWtBackend(options: WispClientOptions): WispWtBackend {
       const resolvedHost = isIPv4(host) ? (ipToName.get(ip4(host)) ?? host) : host.toLowerCase();
       const proxyRoute = client
         .stats()
-        .authProxyRoutes.find((r) => r.virtualHost.toLowerCase() === resolvedHost);
+        .authProxyRoutes.find((r) => r.virtualHost?.toLowerCase() === resolvedHost);
       if (proxyRoute) {
         return client.openHttpProxy(proxyRoute.id, ev);
       }

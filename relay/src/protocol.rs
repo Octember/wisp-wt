@@ -1,5 +1,4 @@
 use anyhow::{Result, bail};
-use bytes::{BufMut, BytesMut};
 
 pub mod stream_kind {
     pub const CONTROL: u8 = 0x00;
@@ -70,40 +69,40 @@ pub struct InfoPayload {
 }
 
 pub fn encode_info(info: &InfoPayload) -> Vec<u8> {
-    let mut buf = BytesMut::new();
-    buf.put_u8(info.major);
-    buf.put_u8(info.minor);
+    let cap = 2 + info
+        .extensions
+        .iter()
+        .map(|e| 5 + e.data.len())
+        .sum::<usize>();
+    let mut buf = Vec::with_capacity(cap);
+    buf.push(info.major);
+    buf.push(info.minor);
     for ext in &info.extensions {
-        buf.put_u8(ext.id);
-        buf.put_u32_le(ext.data.len() as u32);
-        buf.put_slice(&ext.data);
+        buf.push(ext.id);
+        buf.extend_from_slice(&(ext.data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&ext.data);
     }
-    buf.to_vec()
+    buf
 }
 
 pub fn decode_info(data: &[u8]) -> Result<InfoPayload> {
-    if data.len() < 2 {
-        bail!("INFO payload too short");
-    }
-    let major = data[0];
-    let minor = data[1];
-    let mut pos = 2;
+    let (&[major, minor], mut rest) = data
+        .split_first_chunk::<2>()
+        .ok_or_else(|| anyhow::anyhow!("INFO payload too short"))?;
     let mut extensions = Vec::new();
-    while pos < data.len() {
-        if pos + 5 > data.len() {
-            bail!("Truncated extension header in INFO");
-        }
-        let id = data[pos];
-        let len = u32::from_le_bytes(data[pos + 1..pos + 5].try_into().unwrap()) as usize;
-        pos += 5;
-        if pos + len > data.len() {
-            bail!("Truncated extension payload in INFO");
-        }
+    while !rest.is_empty() {
+        let (&[id, b0, b1, b2, b3], after_hdr) = rest
+            .split_first_chunk::<5>()
+            .ok_or_else(|| anyhow::anyhow!("Truncated extension header in INFO"))?;
+        let len = u32::from_le_bytes([b0, b1, b2, b3]) as usize;
+        let (ext_data, after_data) = after_hdr
+            .split_at_checked(len)
+            .ok_or_else(|| anyhow::anyhow!("Truncated extension payload in INFO"))?;
         extensions.push(Extension {
             id,
-            data: data[pos..pos + len].to_vec(),
+            data: ext_data.to_vec(),
         });
-        pos += len;
+        rest = after_data;
     }
     Ok(InfoPayload {
         major,
@@ -164,18 +163,21 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
 
 pub fn extract_token_from_info(info: &InfoPayload) -> Option<String> {
     for ext in &info.extensions {
-        if ext.id == ext_id::BEARER_AUTH
-            && let Ok(s) = std::str::from_utf8(&ext.data)
-        {
-            return Some(s.to_string());
-        }
-        if ext.id == ext_id::PASSWORD_AUTH && !ext.data.is_empty() {
-            let ulen = ext.data[0] as usize;
-            if ulen < ext.data.len()
-                && let Ok(s) = std::str::from_utf8(&ext.data[1 + ulen..])
-            {
-                return Some(s.to_string());
+        match ext.id {
+            ext_id::BEARER_AUTH => {
+                if let Ok(s) = std::str::from_utf8(&ext.data) {
+                    return Some(s.to_string());
+                }
             }
+            ext_id::PASSWORD_AUTH if !ext.data.is_empty() => {
+                let ulen = ext.data[0] as usize;
+                if ulen < ext.data.len()
+                    && let Ok(s) = std::str::from_utf8(&ext.data[1 + ulen..])
+                {
+                    return Some(s.to_string());
+                }
+            }
+            _ => {}
         }
     }
     None

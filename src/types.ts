@@ -78,7 +78,7 @@ export interface WispUdpFlow {
 
 export interface AuthProxyRoute {
   id: string;
-  virtualHost: string;
+  virtualHost?: string;
 }
 
 export interface WispSessionSnapshot {

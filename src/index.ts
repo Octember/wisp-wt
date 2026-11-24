@@ -8,10 +8,12 @@ export {
   WS_STREAM_TYPE,
   WispCloseError,
   type WispExtension,
+  decodeAuthProxyRoutes,
   decodeInfo,
   decodeVarint,
   describeCloseReason,
   encodeControlFrame,
+  encodeHttpProxyConnectHeader,
   encodeInfo,
   encodeTcpConnectHeader,
   encodeUdpBindPayload,
@@ -22,6 +24,7 @@ export {
   varintLength,
 } from "./protocol.ts";
 export type {
+  AuthProxyRoute,
   WebSocketConstructor,
   WebSocketLike,
   WebTransportBidiStreamLike,

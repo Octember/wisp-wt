@@ -8,6 +8,7 @@ import {
   WS_PKT,
   WS_STREAM_TYPE,
   decodeAuthProxyRoutes,
+  decodeInfo,
   encodeControlFrame,
   encodeHttpProxyConnectHeader,
   encodeInfo,
@@ -22,46 +23,6 @@ import type {
   WebTransportLike,
 } from "../src/types.ts";
 import { wispWtBackend } from "../src/unkernel.ts";
-
-type MockWsLike = WebSocketLike & { emitMessage(bytes: Uint8Array): void };
-
-function makeMockWebSocketPair(
-  onClientSend: (data: Uint8Array, ws: MockWsLike) => void,
-): { Impl: WebSocketConstructor; getWs: () => MockWsLike } {
-  let instance!: MockWsLike;
-  class MockWs implements WebSocketLike {
-    binaryType = "arraybuffer";
-    readyState = 1;
-    onopen: ((ev: unknown) => void) | null = null;
-    onclose: ((ev: unknown) => void) | null = null;
-    onerror: ((ev: unknown) => void) | null = null;
-    onmessage: ((ev: { data: unknown }) => void) | null = null;
-
-    constructor(_url: string) {
-      instance = this;
-      queueMicrotask(() => {
-        this.onopen?.({});
-      });
-    }
-
-    send(data: Uint8Array | ArrayBuffer): void {
-      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-      onClientSend(bytes, this);
-    }
-
-    close(): void {
-      this.readyState = 3;
-    }
-
-    emitMessage(bytes: Uint8Array): void {
-      this.onmessage?.({ data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
-    }
-  }
-  return {
-    Impl: MockWs as unknown as WebSocketConstructor,
-    getWs: () => instance,
-  };
-}
 
 describe("Secretless Auth Proxy protocol", () => {
   test("encodeHttpProxyConnectHeader encodes 0x02 header", () => {
@@ -90,10 +51,18 @@ describe("Secretless Auth Proxy protocol", () => {
     expect(
       decodeAuthProxyRoutes([{ id: EXT_ID.AUTH_PROXY, data: utf8Encode("not-json") }]),
     ).toEqual([]);
+
+    expect(
+      decodeAuthProxyRoutes([
+        {
+          id: EXT_ID.AUTH_PROXY,
+          data: utf8Encode(JSON.stringify({ routes: [{ id: "api" }, { id: "gh", virtualHost: "gh.internal" }] })),
+        },
+      ]),
+    ).toEqual([{ id: "api" }, { id: "gh", virtualHost: "gh.internal" }]);
   });
 });
 
-import { decodeInfo } from "../src/protocol.ts";
 function decodeInfoWrapper(buf: Uint8Array) {
   return decodeInfo(buf).extensions;
 }
@@ -181,31 +150,54 @@ describe("WispClient generation, timeout, and error aggregation", () => {
 });
 
 describe("WispWebSocketSession fixes & auth proxy", () => {
-  test("VOLUNTARY close emits onEnd before onClose(null), destroy() is silent, large writes are sliced, and openHttpProxy sends 0x03", async () => {
-    const sent: Uint8Array[] = [];
-    const { Impl } = makeMockWebSocketPair((pkt, ws) => {
-      sent.push(pkt);
-      if (pkt[0] === WS_PKT.INFO) {
-        const cont = new Uint8Array(9);
-        cont[0] = WS_PKT.CONTINUE;
-        new DataView(cont.buffer).setUint32(1, 0, true);
-        new DataView(cont.buffer).setUint32(5, 16, true);
-        ws.emitMessage(cont);
+  test("onClosed propagates closeError to late subscribers", async () => {
+    let wsRef!: WebSocketLike & { emitMessage: (b: Uint8Array) => void };
+    class ErrorCloseWs implements WebSocketLike {
+      binaryType = "arraybuffer";
+      readyState = 1;
+      onopen: ((ev: unknown) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      onerror: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+
+      constructor() {
+        wsRef = this;
+        queueMicrotask(() => {
+          this.onmessage?.({
+            data: encodeWsPacket(WS_PKT.INFO, 0, encodeInfo({ major: 2, minor: 1, extensions: [] })),
+          });
+        });
       }
-    });
+      send(data: Uint8Array | ArrayBuffer): void {
+        const pkt = data instanceof Uint8Array ? data : new Uint8Array(data);
+        if (pkt[0] === WS_PKT.INFO) {
+          const cont = new Uint8Array(9);
+          cont[0] = WS_PKT.CONTINUE;
+          new DataView(cont.buffer).setUint32(5, 8, true);
+          this.emitMessage(cont);
+        }
+      }
+      close(): void {
+        this.readyState = 3;
+      }
+      emitMessage(bytes: Uint8Array): void {
+        this.onmessage?.({ data: bytes });
+      }
+    }
 
     const client = new WispClient({
       wsUrl: "wss://relay.example/",
       mode: "websocket-only",
-      WebSocketImpl: Impl,
+      WebSocketImpl: ErrorCloseWs as unknown as WebSocketConstructor,
     });
-
-    const connectPromise = client.connect();
-    // Wait a tick for onopen, then send server INFO with AUTH_PROXY
-    await new Promise((r) => setTimeout(r, 5));
-    // Actually we need to send server INFO first in mock; let's use a custom mock below.
-    expect(connectPromise).toBeDefined();
-    client.close();
+    const session = await client.connect();
+    wsRef.onclose?.({});
+    let lateErr = null as Error | null;
+    session.onClosed((err) => {
+      lateErr = err;
+    });
+    expect(lateErr).toBeInstanceOf(Error);
+    expect(lateErr?.message).toBe("wisp websocket closed");
   });
 
   test("full WS session lifecycle: authProxyRoutes, openHttpProxy, VOLUNTARY onEnd, >64KiB slice, silent destroy", async () => {

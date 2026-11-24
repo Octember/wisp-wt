@@ -1,4 +1,4 @@
-// oxlint-disable promise/always-return, typescript/no-unsafe-type-assertion
+import { getGlobalCtor, toError } from "./protocol.ts";
 import type {
   WebTransportConstructor,
   WispClientOptions,
@@ -31,7 +31,7 @@ export class WispClient {
   private generation = 0;
 
   constructor(opts: WispClientOptions) {
-    this.opts = opts;
+    this.opts = { ...opts };
   }
 
   setMode(mode: WispTransportMode): void {
@@ -204,13 +204,15 @@ export class WispClient {
       (err) => {
         if (!closed) {
           closed = true;
-          events.onClose(err instanceof Error ? err : new Error(String(err)));
+          events.onClose(toError(err));
         }
       },
     );
 
     return {
-      flowId: 0,
+      get flowId() {
+        return inner?.flowId ?? 0;
+      },
       send(data: Uint8Array) {
         if (closed) return;
         if (inner) inner.send(data);
@@ -245,9 +247,7 @@ export class WispClient {
 
   private hasWebTransport(): boolean {
     if (this.opts.WebTransportImpl) return true;
-    return (
-      typeof (globalThis as { WebTransport?: WebTransportConstructor }).WebTransport === "function"
-    );
+    return getGlobalCtor<WebTransportConstructor>("WebTransport") !== undefined;
   }
 
   private async establishSession(): Promise<WispSession> {
@@ -269,35 +269,49 @@ export class WispClient {
       return WispWebSocketSession.connect(wsUrl, this.opts);
     };
 
-    if (mode === "websocket-only") {
-      this.fallbackReason = "forced websocket-only";
-      const s = await withTimeout(connectWs(), timeoutMs, "WebSocket handshake timed out");
+    const connectSingle = async (
+      fn: () => Promise<WispSession>,
+      timeoutLabel: string,
+      reason: string | null,
+      logMsg?: (ms: number) => string,
+    ): Promise<WispSession> => {
+      this.fallbackReason = reason;
+      const s = await withTimeout(fn(), timeoutMs, timeoutLabel);
       this.handshakeMs = Math.round(performance.now() - t0);
-      log(`[wisp-wt] connected via WebSocket (${this.handshakeMs} ms)`);
+      if (logMsg) log(logMsg(this.handshakeMs));
       return s;
+    };
+
+    if (mode === "websocket-only") {
+      return connectSingle(
+        connectWs,
+        "WebSocket handshake timed out",
+        "forced websocket-only",
+        (ms) => `[wisp-wt] connected via WebSocket (${ms} ms)`,
+      );
     }
 
     if (mode === "webtransport-only") {
-      this.fallbackReason = null;
-      const s = await withTimeout(connectWt(), timeoutMs, "WebTransport handshake timed out");
-      this.handshakeMs = Math.round(performance.now() - t0);
-      log(`[wisp-wt] connected via HTTP/3 WebTransport (${this.handshakeMs} ms)`);
-      return s;
+      return connectSingle(
+        connectWt,
+        "WebTransport handshake timed out",
+        null,
+        (ms) => `[wisp-wt] connected via HTTP/3 WebTransport (${ms} ms)`,
+      );
     }
 
     if (!this.hasWebTransport() || !wtUrl) {
-      this.fallbackReason = !wtUrl ? "no wtUrl configured" : "WebTransport unsupported";
-      const s = await withTimeout(connectWs(), timeoutMs, "WebSocket handshake timed out");
-      this.handshakeMs = Math.round(performance.now() - t0);
-      log(`[wisp-wt] fallback to WebSocket (${this.fallbackReason}, ${this.handshakeMs} ms)`);
-      return s;
+      const reason = !wtUrl ? "no wtUrl configured" : "WebTransport unsupported";
+      return connectSingle(
+        connectWs,
+        "WebSocket handshake timed out",
+        reason,
+        (ms) => `[wisp-wt] fallback to WebSocket (${reason}, ${ms} ms)`,
+      );
     }
 
     if (mode === "auto" && Date.now() < this.udpBlockedUntil && wsUrl) {
-      this.fallbackReason = "cached UDP/443 blocked";
-      const s = await withTimeout(connectWs(), timeoutMs, "WebSocket handshake timed out");
-      this.handshakeMs = Math.round(performance.now() - t0);
-      return s;
+      return connectSingle(connectWs, "WebSocket handshake timed out", "cached UDP/443 blocked");
     }
 
     // Happy-Eyeballs / Race between WebTransport and WebSocket.
