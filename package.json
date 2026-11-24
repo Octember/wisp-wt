@@ -1,6 +1,6 @@
 {
   "name": "wisp-wt",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "WebTransport (HTTP/3) transport binding for Wisp with automatic WebSocket fallback, dual-stack Rust relay, and unkernel NetBackend adapter.",
   "license": "MIT",
   "type": "module",
